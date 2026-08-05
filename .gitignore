@@ -11,5 +11,4 @@ dbt_project/dbt_packages/
 dbt_project/.user.yml
 
 
-# Claude Code session state
-.claude/
+
