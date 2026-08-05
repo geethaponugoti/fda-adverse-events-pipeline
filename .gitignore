@@ -1,0 +1,17 @@
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# dbt
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+dbt_project/.user.yml
+
+# Local pipeline output (data lands in S3, not committed here)
+data/
+
+# Claude Code session state
+.claude/

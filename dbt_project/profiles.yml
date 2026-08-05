@@ -1,0 +1,12 @@
+fda_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type:     postgres
+      host:     postgres
+      user:     pipeline
+      password: pipeline
+      port:     5432
+      dbname:   fda_pipeline
+      schema:   staging
+      threads:  4

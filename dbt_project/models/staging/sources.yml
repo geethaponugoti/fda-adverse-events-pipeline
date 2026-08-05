@@ -1,0 +1,70 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    description: "Raw openFDA drug adverse event reports loaded by Airflow"
+    freshness:
+      warn_after:  {count: 25, period: hour}
+      error_after: {count: 49, period: hour}
+    loaded_at_field: loaded_at
+
+    tables:
+      - name: fda_adverse_events
+        description: "Raw drug adverse event reports pulled daily from the openFDA API (https://api.fda.gov/drug/event.json)"
+        columns:
+          - name: report_id
+            description: "Unique openFDA safety report identifier"
+            tests:
+              - not_null
+
+          - name: received_date
+            description: "Date FDA received the report, as a YYYYMMDD string"
+            tests:
+              - not_null
+
+          - name: serious
+            description: "Whether the report was classified as serious (openFDA code: 1 = yes)"
+
+          - name: serious_death
+            description: "Whether the reaction resulted in death (openFDA code: 1 = yes)"
+
+          - name: serious_hosp
+            description: "Whether the reaction resulted in hospitalization (openFDA code: 1 = yes)"
+
+          - name: serious_life
+            description: "Whether the reaction was life-threatening (openFDA code: 1 = yes)"
+
+          - name: patient_age
+            description: "Patient age at time of the report"
+
+          - name: patient_age_unit
+            description: "Unit of patient_age (e.g. years, months)"
+
+          - name: patient_sex
+            description: "openFDA patient sex code (1 = male, 2 = female)"
+
+          - name: drug_name
+            description: "Name of the drug associated with the adverse event"
+            tests:
+              - not_null
+
+          - name: drug_indication
+            description: "Indication the drug was being used for"
+
+          - name: reaction
+            description: "Reported adverse reaction (MedDRA preferred term)"
+            tests:
+              - not_null
+
+          - name: outcome
+            description: "openFDA outcome code(s) for the report"
+
+          - name: country
+            description: "Country the report originated from"
+
+          - name: loaded_at
+            description: "Timestamp this row was loaded into the raw table"
+
+          - name: load_date
+            description: "Date this row's Airflow load ran"

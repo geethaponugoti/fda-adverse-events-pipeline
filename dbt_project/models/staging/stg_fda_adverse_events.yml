@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: stg_fda_adverse_events
+    description: >
+      Cleaned, typed openFDA adverse event reports. One row per report_id
+      with a proper received_date, boolean seriousness flags, normalized
+      drug/reaction text, and derived is_serious / is_fatal flags.
+    columns:
+      - name: report_id
+        description: Unique openFDA safety report identifier.
+        tests:
+          - not_null
+          - unique
+
+      - name: drug_name
+        description: Uppercased drug name associated with the adverse event.
+        tests:
+          - not_null
+
+      - name: reaction
+        description: Lowercased reported adverse reaction (MedDRA preferred term).
+        tests:
+          - not_null
+
+      - name: patient_sex
+        description: "openFDA patient sex code: 1 = male, 2 = female."
+        tests:
+          - accepted_values:
+              values: ['1', '2']
+
+      - name: is_serious
+        description: True if the report was classified as serious (serious = 1).
+
+      - name: is_fatal
+        description: True if the reaction resulted in death (serious_death = 1).
