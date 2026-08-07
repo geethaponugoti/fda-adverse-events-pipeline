@@ -17,6 +17,7 @@ from qdrant_client.http.models import Distance, VectorParams
 from sentence_transformers import SentenceTransformer
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")  # required for Qdrant Cloud; unset/None for a local container
 
 COLLECTION_NAME = "pipeline_incidents"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -30,7 +31,7 @@ def get_embedding_model() -> SentenceTransformer:
 
 @lru_cache(maxsize=1)
 def get_qdrant_client() -> QdrantClient:
-    return QdrantClient(url=QDRANT_URL)
+    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
 def embed_text(text: str) -> list:
