@@ -6,12 +6,13 @@ x-airflow-common: &airflow-common
     dockerfile: docker/Dockerfile.airflow
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW_DB_CONN}
     AIRFLOW__CORE__FERNET_KEY: ""
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-    PIPELINE_DB_CONN: postgresql+psycopg2://pipeline:pipeline@postgres/fda_pipeline
+    AIRFLOW__WEBSERVER__WORKERS: "1"
+    PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
     AWS_DEFAULT_REGION: us-east-1
   volumes:
     - ./dags:/opt/airflow/dags
@@ -20,26 +21,8 @@ x-airflow-common: &airflow-common
     - ./dbt_project:/opt/airflow/dbt_project
     - airflow_logs:/opt/airflow/logs
     - ~/.aws:/home/airflow/.aws:ro
-  depends_on:
-    postgres:
-      condition: service_healthy
 
 services:
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: 10s
-      retries: 5
-    ports:
-      - "5432:5432"
-
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -47,9 +30,7 @@ services:
       - -c
       - |
         airflow db migrate &&
-        airflow users create --username admin --password admin \
-          --firstname Admin --lastname User \
-          --role Admin --email admin@example.com
+        airflow users create --username admin --password admin           --firstname Admin --lastname User           --role Admin --email admin@example.com
     restart: "no"
 
   airflow-webserver:
@@ -75,12 +56,37 @@ services:
     ports:
       - "8501:8501"
     environment:
-      PIPELINE_DB_CONN: postgresql+psycopg2://pipeline:pipeline@postgres/fda_pipeline
-    depends_on:
-      - postgres
+      PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
     volumes:
       - ./scripts:/app/scripts
 
+  qdrant:
+    image: qdrant/qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_CHANNEL: ${SLACK_CHANNEL}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
+      PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
+      S3_BUCKET: pipeline-fda
+      AWS_DEFAULT_REGION: us-east-1
+      QDRANT_URL: http://qdrant:6333
+      DBT_MANIFEST_PATH: /dbt_project/target/manifest.json
+    volumes:
+      - ~/.aws:/root/.aws:ro
+      - ./dbt_project:/dbt_project:ro
+
 volumes:
-  postgres_data:
   airflow_logs:
+  qdrant_data:
