@@ -30,7 +30,9 @@ services:
       - -c
       - |
         airflow db migrate &&
-        airflow users create --username admin --password admin           --firstname Admin --lastname User           --role Admin --email admin@example.com
+        airflow users create --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com
     restart: "no"
 
   airflow-webserver:
@@ -60,13 +62,6 @@ services:
     volumes:
       - ./scripts:/app/scripts
 
-  qdrant:
-    image: qdrant/qdrant
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-
   agent:
     build:
       context: .
@@ -81,7 +76,8 @@ services:
       PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
       S3_BUCKET: pipeline-fda
       AWS_DEFAULT_REGION: us-east-1
-      QDRANT_URL: http://qdrant:6333
+      QDRANT_URL: ${QDRANT_URL}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
       DBT_MANIFEST_PATH: /dbt_project/target/manifest.json
     volumes:
       - ~/.aws:/root/.aws:ro
@@ -89,4 +85,3 @@ services:
 
 volumes:
   airflow_logs:
-  qdrant_data:
