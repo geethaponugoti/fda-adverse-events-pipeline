@@ -3,7 +3,7 @@ langgraph
 langchain-openai
 fastapi
 uvicorn
-qdrant-client
+qdrant-client==1.19.0
 sentence-transformers
 python-dotenv
 sqlalchemy

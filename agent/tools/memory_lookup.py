@@ -56,11 +56,16 @@ def search_similar_incidents(query_text: str, top_k: int = 3) -> list:
     client = get_qdrant_client()
     query_vector = embed_text(query_text)
 
-    hits = client.search(
+    # query_points(), not the old search() — removed in qdrant-client
+    # 1.19 (pinned in requirements.txt precisely so this doesn't
+    # silently drift and break again the way it just did). Results
+    # come back wrapped in .points instead of being the return value
+    # directly, but each point still has the same .score/.payload shape.
+    hits = client.query_points(
         collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
+        query=query_vector,
         limit=top_k,
-    )
+    ).points
 
     return [
         {
