@@ -31,7 +31,7 @@ from sqlalchemy import create_engine, text
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from tools import airflow_client
+from tools import airflow_client, schema_inspector
 
 logger = logging.getLogger("agent.slack_server")
 
@@ -290,23 +290,43 @@ async def handle_slack_action(raw_body: bytes, timestamp: str, signature: str) -
     approval = _get_approval(incident_id)
     _update_approval_status(incident_id, new_status, user)
 
-    # Approving a P1 (no mechanical fix was available, or graph.py would
-    # have applied it already and never sent an approval request in the
-    # first place) means "go ahead and retry now" — same action
+    # Approving a P1 (no mechanical fix was applied yet — graph.py already
+    # applies it immediately and skips the approval request entirely when
+    # it can) means "apply the fix, then retry" — the same two actions
     # escalation_scheduler takes on timeout, just triggered by a human
-    # instead of the clock.
+    # instead of the clock. The fix must run BEFORE the retry, or the
+    # retried task just fails again with the same error it started with.
+    result_note = ""
     if new_status == "approved" and approval is not None and approval.severity == "P1":
+        fix_detail = None
+        try:
+            fix_detail = schema_inspector.apply_safe_rename_fix()
+        except Exception as exc:
+            logger.error("apply_safe_rename_fix failed after Slack approval for %s: %s",
+                         incident_id, exc)
+
+        retry_ok = True
         try:
             airflow_client.retry_task(approval.dag_id, approval.run_id, approval.task_id)
         except Exception as exc:
+            retry_ok = False
             logger.warning("Airflow retry_task failed after Slack approval for %s: %s",
                            incident_id, exc)
+
+        if fix_detail and retry_ok:
+            result_note = f"\n✅ Fixed: {fix_detail} Task retried — pipeline resuming."
+        elif fix_detail and not retry_ok:
+            result_note = f"\n✅ Fixed: {fix_detail} ⚠️ Retry call failed — retry manually."
+        elif retry_ok:
+            result_note = "\nTask retried (no schema fix was found to apply)."
+        else:
+            result_note = "\n⚠️ Retry call failed."
 
     response_url = payload.get("response_url")
     if response_url:
         async with httpx.AsyncClient() as client:
             await client.post(response_url, json={
-                "text": f"Incident `{incident_id}` marked *{new_status}* by @{user}.",
+                "text": f"Incident `{incident_id}` marked *{new_status}* by @{user}.{result_note}",
                 "replace_original": True,
             }, timeout=10)
 

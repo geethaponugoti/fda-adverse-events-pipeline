@@ -1,11 +1,15 @@
 """
 Tool: queries PostgreSQL information_schema for the live column set of
-raw.fda_adverse_events and diffs it against the most recent batch in
-monitoring.schema_snapshots (written by validate_raw_schema in
-fda_pipeline_dag.py) to detect what changed.
+raw.fda_adverse_events. get_schema_diff() diffs it against the most
+recent batch in monitoring.schema_snapshots (written by
+validate_raw_schema in fda_pipeline_dag.py) for investigation
+purposes. find_safe_rename()/apply_safe_rename_fix() check against a
+fixed canonical schema instead — see their docstrings for why
+snapshot-diffing alone isn't reliable enough to safely auto-fix from.
 """
 
 import os
+from typing import Optional
 
 from sqlalchemy import create_engine, text
 
@@ -13,6 +17,18 @@ PIPELINE_DB_CONN = os.environ.get(
     "PIPELINE_DB_CONN",
     "postgresql+psycopg2://pipeline:pipeline@postgres/fda_pipeline",
 )
+
+# The exact columns raw.fda_adverse_events is created with (see
+# scripts/init_db.sql). Used by find_safe_rename()/apply_safe_rename_fix()
+# as a fixed reference point — see those functions' docstrings for why
+# diffing against monitoring.schema_snapshots isn't reliable enough for
+# this on its own.
+CANONICAL_COLUMNS = {
+    "report_id", "received_date", "serious", "serious_death", "serious_hosp",
+    "serious_life", "patient_age", "patient_age_unit", "patient_sex",
+    "drug_name", "drug_indication", "reaction", "outcome", "country",
+    "loaded_at", "load_date",
+}
 
 
 def _engine():
@@ -85,3 +101,52 @@ def get_schema_diff(
         "current_columns": sorted(current),
         "previous_columns": sorted(previous),
     }
+
+
+def find_safe_rename(
+    schema_name: str = "raw", table_name: str = "fda_adverse_events"
+) -> Optional[tuple]:
+    """Returns (current_name, canonical_name) if the live table is
+    missing exactly one CANONICAL_COLUMNS entry and has exactly one
+    extra column not in that set — the narrow, unambiguous-rename
+    signature this codebase treats as safe to auto-fix. None otherwise.
+
+    Deliberately checks against the fixed CANONICAL_COLUMNS set, not
+    get_schema_diff()'s snapshot comparison: validate_raw_schema
+    re-snapshots the live table's columns on every run, including runs
+    where check_failure_injection already renamed a column earlier in
+    the same DAG run. That makes the "latest snapshot" an unreliable
+    reference — it can itself already reflect the drifted state, which
+    would make diff-based detection blind to a drift that's still
+    actually there."""
+    with _engine().connect() as conn:
+        current = set(_current_columns(conn, schema_name, table_name))
+
+    missing = CANONICAL_COLUMNS - current
+    extra = current - CANONICAL_COLUMNS
+
+    if len(missing) != 1 or len(extra) != 1:
+        return None
+
+    return next(iter(extra)), next(iter(missing))
+
+
+def apply_safe_rename_fix(
+    schema_name: str = "raw", table_name: str = "fda_adverse_events"
+) -> Optional[str]:
+    """Applies the rename find_safe_rename() identifies, if any, and
+    returns a description of what it did (None if there was nothing to
+    fix). Identifiers always come from information_schema — resolved
+    fresh by find_safe_rename() — never from LLM output."""
+    rename = find_safe_rename(schema_name, table_name)
+    if rename is None:
+        return None
+
+    current_name, canonical_name = rename
+    with _engine().begin() as conn:
+        conn.execute(text(
+            f'ALTER TABLE {schema_name}.{table_name} '
+            f'RENAME COLUMN "{current_name}" TO "{canonical_name}"'
+        ))
+
+    return f"Renamed column '{current_name}' back to '{canonical_name}'."

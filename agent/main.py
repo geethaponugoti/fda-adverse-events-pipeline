@@ -24,7 +24,8 @@ from pydantic import BaseModel
 
 import escalation_scheduler
 from graph import compiled_graph
-from mcp_servers.slack_server import handle_slack_action
+from mcp_servers.slack_server import handle_slack_action, post_notification
+from tools import schema_inspector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,8 +34,30 @@ logging.basicConfig(
 logger = logging.getLogger("agent.main")
 
 
+def _startup_schema_check() -> None:
+    """Runs once per boot: if raw.fda_adverse_events is left in a
+    drifted state from a prior incident (e.g. the agent crashed or was
+    redeployed between detecting a schema_drift failure and fixing it),
+    fix it now rather than waiting for the next alert to rediscover it."""
+    try:
+        detail = schema_inspector.apply_safe_rename_fix()
+    except Exception:
+        logger.exception("Startup schema check failed")
+        return
+
+    if detail:
+        logger.warning("Startup schema check found and fixed drift: %s", detail)
+        try:
+            post_notification(f"🔧 Startup check: {detail}")
+        except Exception as exc:
+            logger.warning("Slack notification failed (non-fatal): %s", exc)
+    else:
+        logger.info("Startup schema check: no drift found.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _startup_schema_check()
     scheduler = escalation_scheduler.start()
     yield
     scheduler.shutdown(wait=False)

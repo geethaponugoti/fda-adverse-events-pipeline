@@ -344,29 +344,6 @@ def fix_node(state: AgentState) -> dict:
 # approve_or_escalate
 # --------------------------------------------------------------------------
 
-def _try_auto_fix_schema_drift(investigation: dict) -> Optional[str]:
-    """The only auto-applied DB change in this whole agent: if exactly one
-    column was added and exactly one was removed since the last schema
-    snapshot, rename the current (added) column back to the original
-    (removed) name. Identifiers come from information_schema /
-    monitoring.schema_snapshots, never from LLM output."""
-    diff = investigation.get("details", {}).get("schema_diff", {})
-    added = diff.get("added", [])
-    removed = diff.get("removed", [])
-
-    if len(added) != 1 or len(removed) != 1:
-        return None
-
-    new_name, original_name = added[0], removed[0]
-    with _engine().begin() as conn:
-        conn.execute(text(
-            f'ALTER TABLE raw.fda_adverse_events '
-            f'RENAME COLUMN "{new_name}" TO "{original_name}"'
-        ))
-
-    return f"Auto-renamed column '{new_name}' back to '{original_name}'."
-
-
 def _retry_airflow_task(alert: dict) -> Optional[str]:
     """Best-effort: never lets an Airflow API failure break the graph."""
     try:
@@ -443,7 +420,7 @@ def approve_or_escalate_node(state: AgentState) -> dict:
         applied_detail = None
         if error_type == "schema_drift":
             try:
-                applied_detail = _try_auto_fix_schema_drift(investigation)
+                applied_detail = schema_inspector.apply_safe_rename_fix()
             except Exception as exc:
                 logger.error("auto-fix attempt failed: %s", exc)
 
@@ -457,13 +434,32 @@ def approve_or_escalate_node(state: AgentState) -> dict:
             logger.info("approve_or_escalate: P1 auto_approved. %s", detail)
             return {"approval_status": "auto_approved"}
 
-        # No mechanical fix available (e.g. volume_anomaly, or a schema
-        # diff too ambiguous to auto-rename) — ask, but don't block on
-        # an answer: escalation_scheduler retries the task on our behalf
-        # after SLACK_TIMEOUT_MINUTES if nobody responds.
+        # No mechanical fix applied yet (e.g. volume_anomaly with nothing
+        # to rename, or the rename attempt above raised). For schema_drift
+        # specifically, still check read-only whether a safe rename is
+        # identifiable — if so, preview it in the Slack message so a human
+        # (or escalation_scheduler on timeout) knows exactly what approving
+        # will do; handle_slack_action re-attempts the same fix on approval.
+        approval_summary = summary
+        if error_type == "schema_drift":
+            try:
+                rename = schema_inspector.find_safe_rename()
+            except Exception as exc:
+                logger.error("find_safe_rename failed: %s", exc)
+                rename = None
+            if rename:
+                current_name, canonical_name = rename
+                approval_summary += (
+                    f"\nWill rename column '{current_name}' back to "
+                    f"'{canonical_name}' if approved."
+                )
+
+        # Ask, but don't block on an answer: escalation_scheduler retries
+        # the task on our behalf after SLACK_TIMEOUT_MINUTES if nobody
+        # responds.
         try:
             request_approval(
-                incident_id=incident_id, summary=summary, risk_level=risk_level,
+                incident_id=incident_id, summary=approval_summary, risk_level=risk_level,
                 dag_id=alert["dag_id"], run_id=alert["run_id"], task_id=alert["task_id"],
                 severity="P1", timeout_minutes=SLACK_TIMEOUT_MINUTES,
             )
