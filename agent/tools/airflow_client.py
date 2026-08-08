@@ -23,10 +23,22 @@ def _auth():
 
 def retry_task(dag_id: str, dag_run_id: str, task_id: str) -> dict:
     """Retries a failed task instance. Airflow's REST API models this as
-    a "clear" (not a distinct retry verb) — clearing a failed task
-    instance puts it back in a schedulable state, and the scheduler
-    reschedules it (and, with reset_dag_runs, resumes the rest of the
-    run) automatically."""
+    a "clear" (not a distinct retry verb) — clearing a task instance
+    puts it back in a schedulable state, and the scheduler reschedules
+    it (and, with reset_dag_runs, resumes the rest of the run)
+    automatically.
+
+    include_downstream matters here: this DAG is a linear chain, so a
+    failed task cascades "upstream_failed" (a *different* terminal
+    state from "failed") to everything after it. Without
+    include_downstream, clearing just the one task_id leaves those
+    downstream tasks permanently stuck even after the retry succeeds —
+    Airflow doesn't retroactively re-evaluate an already-terminal
+    downstream task just because its upstream succeeded later.
+    only_failed is deliberately omitted (not just left False) —
+    "upstream_failed" tasks aren't "failed", so that filter would
+    silently exclude exactly the downstream tasks include_downstream
+    is meant to catch."""
     resp = requests.post(
         f"{AIRFLOW_API_URL}/dags/{dag_id}/clearTaskInstances",
         auth=_auth(),
@@ -34,7 +46,7 @@ def retry_task(dag_id: str, dag_run_id: str, task_id: str) -> dict:
             "dry_run": False,
             "task_ids": [task_id],
             "dag_run_id": dag_run_id,
-            "only_failed": True,
+            "include_downstream": True,
             "reset_dag_runs": True,
         },
         timeout=_TIMEOUT_SECONDS,
