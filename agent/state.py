@@ -72,8 +72,6 @@ class AgentState(TypedDict, total=False):
     approve_or_escalate -> postmortem."""
 
     alert: AlertPayload
-    started_at: float  # time.time() epoch, set by ingest_node; used by
-                        # postmortem.py to compute duration_seconds.
     parsed_log: ParsedLog
     error_type: Optional[ErrorType]
     investigation: InvestigationFindings

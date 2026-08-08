@@ -16,7 +16,6 @@ diagnosed incident into a 500 back to the /alert caller.
 import datetime as dt
 import logging
 import os
-import time
 import uuid
 
 from qdrant_client.http.models import PointStruct
@@ -50,40 +49,37 @@ def _build_summary(state: dict) -> str:
     )
 
 
-def _build_postmortem_text(postmortem: dict) -> str:
-    return (
-        f"Incident {postmortem['incident_id']}\n"
-        f"DAG: {postmortem['dag_id']}  Task: {postmortem['task_id']}  "
-        f"Run: {postmortem['run_id']}\n"
-        f"Failure type: {postmortem['error_type']}\n"
-        f"Risk level: {postmortem['risk_level']}\n"
-        f"Approval status: {postmortem['approval_status']}\n\n"
-        f"Root cause:\n{postmortem['root_cause']}\n\n"
-        f"Fix applied:\n{postmortem['resolution']}"
+def _insert_incident_report(state: dict, postmortem: dict) -> None:
+    """monitoring.incident_reports' actual live schema is
+    (dag_id, run_id, task_id, error_type, error_message, fix_attempted,
+    fix_result, approved, created_at) — no incident_id/failure_type/
+    root_cause/fix_applied/fix_status/duration_seconds/postmortem_text.
+    Column names here must match that, not the postmortem dict's own
+    (differently-named) keys."""
+    approval_status = postmortem["approval_status"]
+    approved = (
+        True if approval_status in ("auto_approved", "approved")
+        else False if approval_status == "rejected"
+        else None  # pending / escalated: not yet decided
     )
+    parsed_log = state.get("parsed_log") or {}
 
-
-def _insert_incident_report(
-    postmortem: dict, duration_seconds, postmortem_text: str
-) -> None:
     with _engine().begin() as conn:
         conn.execute(text("""
             INSERT INTO monitoring.incident_reports
-                (incident_id, dag_id, task_id, failure_type, root_cause,
-                 fix_applied, fix_status, duration_seconds, postmortem_text)
-            VALUES (:incident_id, :dag_id, :task_id, :failure_type,
-                    :root_cause, :fix_applied, :fix_status,
-                    :duration_seconds, :postmortem_text)
+                (dag_id, run_id, task_id, error_type, error_message,
+                 fix_attempted, fix_result, approved, created_at)
+            VALUES (:dag_id, :run_id, :task_id, :error_type, :error_message,
+                    :fix_attempted, :fix_result, :approved, NOW())
         """), {
-            "incident_id": postmortem["incident_id"],
             "dag_id": postmortem["dag_id"],
+            "run_id": postmortem["run_id"],
             "task_id": postmortem["task_id"],
-            "failure_type": postmortem["error_type"],
-            "root_cause": postmortem["root_cause"],
-            "fix_applied": postmortem["resolution"],
-            "fix_status": postmortem["approval_status"],
-            "duration_seconds": duration_seconds,
-            "postmortem_text": postmortem_text,
+            "error_type": postmortem["error_type"],
+            "error_message": parsed_log.get("error_message") or postmortem["root_cause"],
+            "fix_attempted": postmortem["resolution"],
+            "fix_result": approval_status,
+            "approved": approved,
         })
 
 
@@ -124,13 +120,8 @@ def write_postmortem(state: dict) -> dict:
         points=[PointStruct(id=incident_id, vector=vector, payload=postmortem)],
     )
 
-    started_at = state.get("started_at")
-    duration_seconds = int(round(time.time() - started_at)) if started_at else None
-
     try:
-        _insert_incident_report(
-            postmortem, duration_seconds, _build_postmortem_text(postmortem)
-        )
+        _insert_incident_report(state, postmortem)
     except Exception as exc:
         logger.warning(
             "Failed to write monitoring.incident_reports row for incident %s "

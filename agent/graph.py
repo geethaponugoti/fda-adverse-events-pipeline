@@ -19,7 +19,6 @@ monitoring.schema_snapshots — not from LLM output.
 import json
 import logging
 import os
-import time
 import uuid
 from typing import Literal, Optional
 
@@ -60,7 +59,7 @@ def ingest_node(state: AgentState) -> dict:
     logger.info("ingest: task_id=%s error_message=%s error_type_hint=%s",
                 parsed_log["task_id"], parsed_log["error_message"],
                 parsed_log["error_type_hint"])
-    return {"parsed_log": parsed_log, "started_at": time.time()}
+    return {"parsed_log": parsed_log}
 
 
 # --------------------------------------------------------------------------
