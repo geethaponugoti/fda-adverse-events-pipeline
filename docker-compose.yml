@@ -12,6 +12,10 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__WEBSERVER__WORKERS: "1"
+    # Default is session-only, which 401s any plain HTTP basic-auth
+    # request — the agent (EC2 #2) and the dashboard's paused-DAG check
+    # both call the REST API this way, not through a browser session.
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.session,airflow.api.auth.backend.basic_auth"
     PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
     PIPELINE_DB_HOST: ${PIPELINE_DB_HOST}
     PIPELINE_DB_PORT: ${PIPELINE_DB_PORT}
