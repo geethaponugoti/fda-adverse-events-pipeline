@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir \
     psycopg2-binary
 
 COPY scripts/ ./scripts/
+COPY .streamlit/ ./.streamlit/
 
 EXPOSE 8501
 
