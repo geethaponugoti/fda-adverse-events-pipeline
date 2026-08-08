@@ -10,10 +10,18 @@ into the running state.
 from typing import Literal, Optional, TypedDict
 
 ErrorType = Literal[
-    "schema_drift", "volume_anomaly", "data_quality", "upstream_failure"
+    "data_corruption", "schema_drift", "volume_anomaly",
+    "data_quality", "freshness", "upstream_failure",
 ]
 
 RiskLevel = Literal["low", "medium", "high"]
+
+# P0 = data corruption: pause the DAG immediately, escalate.
+# P1 = schema drift / volume anomaly: auto-fix, notify Slack, auto-apply
+#      if unanswered after SLACK_TIMEOUT_MINUTES.
+# P2 = data quality / freshness: auto-fix silently, log only.
+# P3 = upstream/infra failure: log only, no fix attempted.
+Severity = Literal["P0", "P1", "P2", "P3"]
 
 ApprovalStatus = Literal[
     "pending", "auto_approved", "escalated", "approved", "rejected"
@@ -59,6 +67,7 @@ class Postmortem(TypedDict):
     run_id: str
     task_id: str
     error_type: Optional[ErrorType]
+    severity: Optional[Severity]
     summary: str
     root_cause: str
     resolution: str
@@ -74,6 +83,7 @@ class AgentState(TypedDict, total=False):
     alert: AlertPayload
     parsed_log: ParsedLog
     error_type: Optional[ErrorType]
+    severity: Optional[Severity]
     investigation: InvestigationFindings
     proposed_fix: ProposedFix
     approval_status: ApprovalStatus

@@ -8,6 +8,7 @@ import datetime
 import logging
 import os
 import subprocess
+import time
 from datetime import date, timedelta
 from io import StringIO
 
@@ -52,6 +53,11 @@ EXPECTED_COLUMNS = {
 
 # Date range that has confirmed data in the API
 FDA_DATE_RANGE = "receiptdate:[20250401 TO 20260401]"
+
+# Exponential backoff for FDA API failures: 1min, 2min, 4min between the
+# 4 total attempts (1 initial + 3 retries). If all of them fail, extract
+# falls back to the most recent cached file in S3.
+FDA_API_BACKOFF_SECONDS = [60, 120, 240]
 
 
 def _engine():
@@ -152,6 +158,103 @@ def _read_csv_from_s3(s3_key: str, **read_csv_kwargs) -> pd.DataFrame:
     return pd.read_csv(obj["Body"], **read_csv_kwargs)
 
 
+def _fetch_fda_pages(skip_start: int, load_date: str) -> list:
+    """One full paginated fetch attempt. Raises on any request failure
+    (timeout, connection error, non-404 HTTP error) so the caller can
+    retry with backoff — a failure partway through a page set leaves an
+    incomplete/inconsistent result, not something worth keeping."""
+    all_rows = []
+    skip = skip_start
+
+    for page in range(MAX_PAGES):
+        params = {"search": FDA_DATE_RANGE, "limit": PAGE_LIMIT, "skip": skip}
+        resp = requests.get(FDA_API_URL, params=params, timeout=30)
+
+        if resp.status_code == 404:
+            logger.info("No FDA reports found")
+            break
+
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+
+        if not results:
+            logger.info("No more results at page %d", page + 1)
+            break
+
+        for report in results:
+            all_rows.append(_flatten_report(report, load_date))
+
+        skip += PAGE_LIMIT
+        logger.info("Page %d: fetched %d total rows", page + 1, len(all_rows))
+
+        total = data.get("meta", {}).get("results", {}).get("total", 0)
+        if skip >= total:
+            break
+
+    return all_rows
+
+
+def _fetch_fda_data_with_backoff(skip_start: int, load_date: str) -> list:
+    """Retries the full FDA API fetch with exponential backoff
+    (FDA_API_BACKOFF_SECONDS) on transient failures. Re-raises the last
+    exception if every attempt fails, so the caller can fall back to S3."""
+    last_exc = None
+    for attempt, delay in enumerate([0] + FDA_API_BACKOFF_SECONDS):
+        if delay:
+            logger.warning(
+                "FDA API attempt %d failed (%s) — retrying in %ds",
+                attempt, last_exc, delay,
+            )
+            time.sleep(delay)
+        try:
+            return _fetch_fda_pages(skip_start, load_date)
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+
+    logger.error(
+        "FDA API failed after %d attempts: %s",
+        len(FDA_API_BACKOFF_SECONDS) + 1, last_exc,
+    )
+    raise last_exc
+
+
+def _load_most_recent_s3_file() -> tuple[pd.DataFrame, str]:
+    """Falls back to the most recently uploaded raw/ file in S3 when the
+    FDA API is unreachable after all retries. Filenames are
+    fda_events_YYYY-MM-DD.csv, so a lexicographic max on the key also
+    gives the chronologically most recent file."""
+    keys = _list_s3_keys("raw/", max_keys=1000)
+    if not keys:
+        raise RuntimeError(
+            f"FDA API unreachable and no cached files found under "
+            f"s3://{S3_BUCKET}/raw/ to fall back to."
+        )
+    most_recent_key = max(keys)
+    df = _read_csv_from_s3(most_recent_key)
+    logger.warning("Using cached S3 fallback file: s3://%s/%s", S3_BUCKET, most_recent_key)
+    return df, most_recent_key
+
+
+def _record_freshness_check(
+    used_cache: bool, table_name: str = "fda_adverse_events", schema_name: str = "raw"
+) -> None:
+    """Called once per successful load_to_postgres run — records whether
+    this load came from a live FDA API pull or the S3 fallback, so the
+    dashboard can show a "using cached data" warning when it's stale."""
+    with _engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO monitoring.freshness_checks
+                (table_name, schema_name, last_loaded, is_stale, data_source)
+            VALUES (:table_name, :schema_name, NOW(), :is_stale, :data_source)
+        """), {
+            "table_name": table_name,
+            "schema_name": schema_name,
+            "is_stale": used_cache,
+            "data_source": "cached" if used_cache else "live",
+        })
+
+
 def check_failure_injection(**context):
     dag_id  = context["dag"].dag_id
     run_id  = context["run_id"]
@@ -246,81 +349,61 @@ def extract_fda_data(**context):
 
     run_row_id = _log_start(dag_id, run_id, task_id)
     try:
-        s3_key = f"raw/fda_events_{load_date}.csv"
-
         with _engine().begin() as conn:
             already_loaded = conn.execute(text(
                 "SELECT COUNT(*) FROM raw.fda_adverse_events"
             )).scalar_one()
 
-        all_rows = []
-        skip     = already_loaded
-
         logger.info(
             "Fetching FDA adverse events for range %s, starting at skip=%d "
-            "(%d records already loaded)", FDA_DATE_RANGE, skip, already_loaded
+            "(%d records already loaded)", FDA_DATE_RANGE, already_loaded, already_loaded
         )
 
-        for page in range(MAX_PAGES):
-            params = {
-                "search": FDA_DATE_RANGE,
-                "limit":  PAGE_LIMIT,
-                "skip":   skip,
-            }
-            resp = requests.get(FDA_API_URL, params=params, timeout=30)
-
-            if resp.status_code == 404:
-                logger.info("No FDA reports found")
-                break
-
-            resp.raise_for_status()
-            data    = resp.json()
-            results = data.get("results", [])
-
-            if not results:
-                logger.info("No more results at page %d", page + 1)
-                break
-
-            for report in results:
-                all_rows.append(_flatten_report(report, load_date))
-
-            skip += PAGE_LIMIT
-            logger.info("Page %d: fetched %d total rows", page + 1, len(all_rows))
-
-            total = data.get("meta", {}).get("results", {}).get("total", 0)
-            if skip >= total:
-                break
-
-        if not all_rows:
-            logger.warning(
-                "No new records returned from FDA API at skip=%d — "
-                "date range is fully paginated, nothing to load", skip
+        used_cache = False
+        try:
+            all_rows = _fetch_fda_data_with_backoff(already_loaded, load_date)
+        except requests.exceptions.RequestException as exc:
+            logger.error(
+                "FDA API unreachable after %d attempts (%s) — falling back "
+                "to the most recent cached file in S3",
+                len(FDA_API_BACKOFF_SECONDS) + 1, exc,
             )
-            _log_finish(run_row_id, "success", rows_processed=0)
-            raise AirflowSkipException(
-                "No new FDA records to extract; skipping downstream tasks"
-            )
+            df, s3_key = _load_most_recent_s3_file()
+            used_cache = True
 
-        df = pd.DataFrame(all_rows)
+        if not used_cache:
+            if not all_rows:
+                logger.warning(
+                    "No new records returned from FDA API at skip=%d — "
+                    "date range is fully paginated, nothing to load", already_loaded
+                )
+                _log_finish(run_row_id, "success", rows_processed=0)
+                raise AirflowSkipException(
+                    "No new FDA records to extract; skipping downstream tasks"
+                )
 
-        csv_buffer = StringIO()
-        df.to_csv(csv_buffer, index=False)
+            df = pd.DataFrame(all_rows)
+            s3_key = f"raw/fda_events_{load_date}.csv"
 
-        s3 = boto3.client("s3")
-        s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=csv_buffer.getvalue())
+            csv_buffer = StringIO()
+            df.to_csv(csv_buffer, index=False)
 
-        if not _s3_object_exists(s3_key):
-            raise RuntimeError(
-                f"Uploaded to s3://{S3_BUCKET}/{s3_key} but the object is not "
-                f"visible immediately after put_object — refusing to continue "
-                f"since downstream tasks would fail with NoSuchKey."
-            )
+            s3 = boto3.client("s3")
+            s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=csv_buffer.getvalue())
 
-        logger.info("Saved %d rows to s3://%s/%s", len(df), S3_BUCKET, s3_key)
+            if not _s3_object_exists(s3_key):
+                raise RuntimeError(
+                    f"Uploaded to s3://{S3_BUCKET}/{s3_key} but the object is not "
+                    f"visible immediately after put_object — refusing to continue "
+                    f"since downstream tasks would fail with NoSuchKey."
+                )
 
-        context["ti"].xcom_push(key="s3_key",    value=s3_key)
-        context["ti"].xcom_push(key="row_count", value=len(df))
-        context["ti"].xcom_push(key="load_date", value=load_date)
+            logger.info("Saved %d rows to s3://%s/%s", len(df), S3_BUCKET, s3_key)
+
+        context["ti"].xcom_push(key="s3_key",     value=s3_key)
+        context["ti"].xcom_push(key="row_count",  value=len(df))
+        context["ti"].xcom_push(key="load_date",  value=load_date)
+        context["ti"].xcom_push(key="used_cache", value=used_cache)
 
         _log_finish(run_row_id, "success", rows_processed=len(df))
 
@@ -400,6 +483,9 @@ def load_to_postgres(**context):
         s3_key = context["ti"].xcom_pull(
             task_ids="extract_fda_data", key="s3_key"
         )
+        used_cache = bool(context["ti"].xcom_pull(
+            task_ids="extract_fda_data", key="used_cache"
+        ))
 
         df = _read_csv_from_s3(s3_key)
         df.columns = [c.lower() for c in df.columns]
@@ -446,11 +532,7 @@ def load_to_postgres(**context):
                 VALUES ('fda_adverse_events', 'raw', :count)
             """), {"count": len(df)})
 
-            conn.execute(text("""
-                INSERT INTO monitoring.freshness_checks
-                    (table_name, schema_name, last_loaded, is_stale)
-                VALUES ('fda_adverse_events', 'raw', NOW(), FALSE)
-            """))
+        _record_freshness_check(used_cache)
 
         logger.info("Loaded %d rows into raw.fda_adverse_events", len(df))
         _log_finish(run_row_id, "success", rows_processed=len(df))

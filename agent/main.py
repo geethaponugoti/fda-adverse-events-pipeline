@@ -15,12 +15,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+import escalation_scheduler
 from graph import compiled_graph
 from mcp_servers.slack_server import handle_slack_action
 
@@ -30,7 +32,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent.main")
 
-app = FastAPI(title="FDA Pipeline Self-Healing Agent")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = escalation_scheduler.start()
+    yield
+    scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title="FDA Pipeline Self-Healing Agent", lifespan=lifespan)
 
 
 class AlertRequest(BaseModel):

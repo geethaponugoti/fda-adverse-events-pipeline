@@ -19,12 +19,20 @@ Dark theme is set in .streamlit/config.toml, not injected CSS.
 import os
 
 import pandas as pd
+import requests
 import streamlit as st
 from sqlalchemy import create_engine, text
 
 DB_CONN = os.environ.get(
     "PIPELINE_DB_CONN", "postgresql+psycopg2://pipeline:pipeline@localhost/fda_pipeline"
 )
+
+# Airflow runs on the same EC2 instance as this dashboard, so localhost
+# is a safe default — only override if that ever changes.
+AIRFLOW_API_URL = os.environ.get("AIRFLOW_API_URL", "http://localhost:8080/api/v1")
+AIRFLOW_USERNAME = os.environ.get("AIRFLOW_USERNAME", "admin")
+AIRFLOW_PASSWORD = os.environ.get("AIRFLOW_PASSWORD", "admin")
+AIRFLOW_DAG_ID = os.environ.get("AIRFLOW_DAG_ID", "fda_pipeline_dag")
 
 CACHE_TTL_SECONDS = 30
 
@@ -107,10 +115,28 @@ def load_freshness_status(_cache_key: str) -> pd.DataFrame:
     indicator, not a trend (that's what the row-count chart is for)."""
     return _safe_read_sql("""
         SELECT DISTINCT ON (table_name)
-            table_name, schema_name, last_loaded, is_stale
+            table_name, schema_name, last_loaded, is_stale,
+            COALESCE(data_source, 'live') AS data_source
         FROM monitoring.freshness_checks
         ORDER BY table_name, checked_at DESC
     """)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def check_dag_paused(_cache_key: str) -> bool | None:
+    """None means "couldn't reach Airflow to check" (e.g. mid-restart) —
+    kept distinct from False so the dashboard doesn't claim the pipeline
+    is running when it genuinely doesn't know."""
+    try:
+        resp = requests.get(
+            f"{AIRFLOW_API_URL}/dags/{AIRFLOW_DAG_ID}",
+            auth=(AIRFLOW_USERNAME, AIRFLOW_PASSWORD),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return bool(resp.json().get("is_paused"))
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
@@ -193,6 +219,22 @@ def main():
 
     cache_key = "v2"
 
+    dag_paused = check_dag_paused(cache_key)
+    if dag_paused:
+        st.error(
+            f"🚨 **Pipeline paused — action required.** `{AIRFLOW_DAG_ID}` was "
+            f"paused by the self-healing agent after a P0 incident (data "
+            f"corruption) and needs a human to review and resume it in Airflow."
+        )
+
+    freshness_df = load_freshness_status(cache_key)
+    if not freshness_df.empty and (freshness_df["data_source"] == "cached").any():
+        st.warning(
+            "⚠️ **Using cached data.** The FDA API was unreachable after all "
+            "retries on the most recent extraction — the pipeline fell back "
+            "to the most recent file in S3 instead of live data."
+        )
+
     # ===================== Pipeline Monitor =====================
     st.header("Pipeline Monitor")
 
@@ -228,17 +270,17 @@ def main():
     fresh_col, trend_col = st.columns([1, 2])
     with fresh_col:
         st.subheader("Data Freshness")
-        freshness_df = load_freshness_status(cache_key)
         if freshness_df.empty:
             st.info("No freshness checks recorded yet.")
         else:
             for _, row in freshness_df.iterrows():
                 label = f"{row['schema_name']}.{row['table_name']}"
                 loaded = row["last_loaded"]
+                source_tag = " (cached)" if row["data_source"] == "cached" else ""
                 if row["is_stale"]:
-                    st.error(f"**{label}**  \nStale — last loaded {loaded}")
+                    st.error(f"**{label}**{source_tag}  \nStale — last loaded {loaded}")
                 else:
-                    st.success(f"**{label}**  \nFresh — last loaded {loaded}")
+                    st.success(f"**{label}**{source_tag}  \nFresh — last loaded {loaded}")
 
     with trend_col:
         st.subheader("Row Count Trend")

@@ -14,3 +14,4 @@ pandas
 pydantic
 httpx
 fastmcp
+apscheduler

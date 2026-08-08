@@ -77,7 +77,45 @@ CREATE TABLE monitoring.freshness_checks (
     schema_name  VARCHAR(50)  NOT NULL,
     last_loaded  TIMESTAMP,
     checked_at   TIMESTAMP    DEFAULT NOW(),
-    is_stale     BOOLEAN      DEFAULT FALSE
+    is_stale     BOOLEAN      DEFAULT FALSE,
+    -- 'live' (default) or 'cached' — set when extract_fda_data falls
+    -- back to the most recent S3 file after the FDA API is unreachable.
+    data_source  VARCHAR(20)  DEFAULT 'live'
+);
+
+-- Matches what agent/postmortem.py actually inserts — see that file's
+-- _insert_incident_report() for the column mapping.
+CREATE TABLE monitoring.incident_reports (
+    id             SERIAL PRIMARY KEY,
+    dag_id         VARCHAR(200),
+    run_id         VARCHAR(200),
+    task_id        VARCHAR(200),
+    error_type     VARCHAR(50),
+    error_message  TEXT,
+    fix_attempted  TEXT,
+    fix_result     VARCHAR(50),
+    approved       BOOLEAN,
+    created_at     TIMESTAMP DEFAULT NOW()
+);
+
+-- Normally created on demand by agent/mcp_servers/slack_server.py's
+-- _ensure_approvals_table(); included here too so a fresh install's
+-- schema matches what the running agent expects without waiting for
+-- the first Slack approval request to create it.
+CREATE TABLE monitoring.agent_approvals (
+    incident_id               VARCHAR(64) PRIMARY KEY,
+    dag_id                    VARCHAR(200),
+    run_id                    VARCHAR(200),
+    task_id                   VARCHAR(200),
+    summary                   TEXT,
+    risk_level                VARCHAR(20),
+    severity                  VARCHAR(10),
+    status                    VARCHAR(20) NOT NULL DEFAULT 'pending',
+    created_at                TIMESTAMP DEFAULT NOW(),
+    resolved_at               TIMESTAMP,
+    resolved_by               VARCHAR(200),
+    escalation_email_sent_at  TIMESTAMP,
+    dag_paused_at             TIMESTAMP
 );
 
 GRANT ALL ON ALL TABLES    IN SCHEMA raw        TO pipeline;

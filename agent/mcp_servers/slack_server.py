@@ -20,6 +20,7 @@ whoever clicks the button in Slack resolves it later via the webhook.
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from urllib.parse import parse_qs
@@ -29,6 +30,10 @@ from fastmcp import FastMCP
 from sqlalchemy import create_engine, text
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+
+from tools import airflow_client
+
+logger = logging.getLogger("agent.slack_server")
 
 PIPELINE_DB_CONN = os.environ.get(
     "PIPELINE_DB_CONN",
@@ -63,25 +68,39 @@ def _ensure_approvals_table() -> None:
                 resolved_by  VARCHAR(200)
             )
         """))
+        # Added for severity-based escalation (P0/P1 timeout ladder) —
+        # ADD COLUMN IF NOT EXISTS keeps this safe to run against a table
+        # created by an older version of this function.
+        conn.execute(text("""
+            ALTER TABLE monitoring.agent_approvals
+                ADD COLUMN IF NOT EXISTS run_id VARCHAR(200),
+                ADD COLUMN IF NOT EXISTS severity VARCHAR(10),
+                ADD COLUMN IF NOT EXISTS escalation_email_sent_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS dag_paused_at TIMESTAMP
+        """))
 
 
 def _insert_pending(
-    incident_id: str, summary: str, risk_level: str, dag_id: str, task_id: str
+    incident_id: str, summary: str, risk_level: str,
+    dag_id: str, run_id: str, task_id: str, severity: str,
 ) -> None:
     with _engine().begin() as conn:
         conn.execute(text("""
             INSERT INTO monitoring.agent_approvals
-                (incident_id, dag_id, task_id, summary, risk_level, status)
-            VALUES (:incident_id, :dag_id, :task_id, :summary, :risk_level, 'pending')
+                (incident_id, dag_id, run_id, task_id, summary, risk_level, severity, status)
+            VALUES (:incident_id, :dag_id, :run_id, :task_id, :summary, :risk_level, :severity, 'pending')
             ON CONFLICT (incident_id) DO UPDATE SET
                 summary    = EXCLUDED.summary,
-                risk_level = EXCLUDED.risk_level
+                risk_level = EXCLUDED.risk_level,
+                severity   = EXCLUDED.severity
         """), {
             "incident_id": incident_id,
             "dag_id": dag_id,
+            "run_id": run_id,
             "task_id": task_id,
             "summary": summary,
             "risk_level": risk_level,
+            "severity": severity,
         })
 
 
@@ -92,6 +111,14 @@ def _update_approval_status(incident_id: str, status: str, resolved_by: str) -> 
             SET status = :status, resolved_at = NOW(), resolved_by = :resolved_by
             WHERE incident_id = :incident_id
         """), {"status": status, "resolved_by": resolved_by, "incident_id": incident_id})
+
+
+def _get_approval(incident_id: str):
+    with _engine().connect() as conn:
+        return conn.execute(text("""
+            SELECT dag_id, run_id, task_id, severity
+            FROM monitoring.agent_approvals WHERE incident_id = :incident_id
+        """), {"incident_id": incident_id}).fetchone()
 
 
 def _post_to_slack(text_: str, blocks: list) -> dict:
@@ -116,16 +143,31 @@ def request_approval(
     summary: str,
     risk_level: str,
     dag_id: str = "",
+    run_id: str = "",
     task_id: str = "",
+    severity: str = "",
+    timeout_minutes: int = 0,
 ) -> dict:
     """Posts an incident to Slack with Approve/Reject buttons and records
-    it as pending in monitoring.agent_approvals. Called for medium-risk
-    fixes (need a human nod) and high-risk fixes (need a human, full
-    stop) alike — the only difference is the urgency framing."""
-    _ensure_approvals_table()
-    _insert_pending(incident_id, summary, risk_level, dag_id, task_id)
+    it as pending in monitoring.agent_approvals.
 
-    urgency = "🚨 HIGH RISK — do not auto-apply" if risk_level == "high" else "⚠️ Review needed"
+    severity/timeout_minutes only change the message framing — the
+    escalation_scheduler (not this function) is what actually enforces
+    the P0 email/pause and P1 auto-apply timeouts by polling
+    monitoring.agent_approvals for rows still 'pending' past their
+    deadline."""
+    _ensure_approvals_table()
+    _insert_pending(incident_id, summary, risk_level, dag_id, run_id, task_id, severity)
+
+    if severity == "P0":
+        urgency = "🚨 P0 — DAG PAUSED — urgent response required"
+    elif severity == "P1" and timeout_minutes:
+        urgency = f"⚠️ P1 — will auto-apply in {timeout_minutes} min if unanswered"
+    elif risk_level == "high":
+        urgency = "🚨 HIGH RISK — do not auto-apply"
+    else:
+        urgency = "⚠️ Review needed"
+
     message_text = f"{urgency}: {summary}"
     blocks = [
         {
@@ -245,7 +287,20 @@ async def handle_slack_action(raw_body: bytes, timestamp: str, signature: str) -
     user = payload.get("user", {}).get("username", "unknown")
 
     new_status = "approved" if action_id == "approve" else "rejected"
+    approval = _get_approval(incident_id)
     _update_approval_status(incident_id, new_status, user)
+
+    # Approving a P1 (no mechanical fix was available, or graph.py would
+    # have applied it already and never sent an approval request in the
+    # first place) means "go ahead and retry now" — same action
+    # escalation_scheduler takes on timeout, just triggered by a human
+    # instead of the clock.
+    if new_status == "approved" and approval is not None and approval.severity == "P1":
+        try:
+            airflow_client.retry_task(approval.dag_id, approval.run_id, approval.task_id)
+        except Exception as exc:
+            logger.warning("Airflow retry_task failed after Slack approval for %s: %s",
+                           incident_id, exc)
 
     response_url = payload.get("response_url")
     if response_url:

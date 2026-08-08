@@ -24,6 +24,15 @@ services:
       QDRANT_URL: ${QDRANT_URL}
       QDRANT_API_KEY: ${QDRANT_API_KEY}
       DBT_MANIFEST_PATH: /dbt_project/target/manifest.json
+      AIRFLOW_API_URL: ${AIRFLOW_API_URL}
+      AIRFLOW_USERNAME: ${AIRFLOW_USERNAME}
+      AIRFLOW_PASSWORD: ${AIRFLOW_PASSWORD}
+      SLACK_TIMEOUT_MINUTES: ${SLACK_TIMEOUT_MINUTES}
+      ESCALATION_EMAIL: ${ESCALATION_EMAIL}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
     volumes:
       - ~/.aws:/root/.aws:ro
       - ./dbt_project:/dbt_project:ro

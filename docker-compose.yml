@@ -67,8 +67,17 @@ services:
       - "8501:8501"
     environment:
       PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
+      # Docker-internal service DNS, not ${AIRFLOW_API_URL} — that env
+      # var is the *public* endpoint EC2 #2 (a separate host) needs;
+      # streamlit and airflow-webserver share this compose file's
+      # network, so the service name is the correct, direct route.
+      AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
+      AIRFLOW_USERNAME: ${AIRFLOW_USERNAME}
+      AIRFLOW_PASSWORD: ${AIRFLOW_PASSWORD}
     volumes:
       - ./scripts:/app/scripts
+    depends_on:
+      - airflow-webserver
 
 volumes:
   airflow_logs:

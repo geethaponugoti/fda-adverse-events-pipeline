@@ -2,18 +2,22 @@
 LangGraph graph definition for the FDA pipeline self-healing agent.
 
 Six nodes, run in a fixed sequence (no branching in the graph itself —
-the branching happens inside approve_or_escalate based on risk_level):
+the branching happens inside approve_or_escalate, based on severity,
+P0-P3, computed in classify_node from error_type via SEVERITY_MAP):
 
     ingest -> classify -> investigate -> fix -> approve_or_escalate -> postmortem
 
 Safety note: the `fix` node asks the LLM to propose SQL, but that SQL
 is advisory only — it's surfaced to a human in Slack / the postmortem,
-never executed. The only DB write approve_or_escalate ever makes
-automatically is a single, narrowly-scoped case: renaming a column
-back to its pre-drift name, and only when schema_inspector found
-exactly one column added and exactly one removed (an unambiguous
-rename), with the identifiers coming from information_schema /
-monitoring.schema_snapshots — not from LLM output.
+never executed, regardless of severity. The only DB write
+approve_or_escalate ever makes automatically is a single,
+narrowly-scoped case: renaming a column back to its pre-drift name,
+and only when schema_inspector found exactly one column added and
+exactly one removed (an unambiguous rename), with the identifiers
+coming from information_schema / monitoring.schema_snapshots — not
+from LLM output. Every other "auto-fix" action is a retry of the
+Airflow task via airflow_client, which is safe regardless of what
+caused the original failure.
 """
 
 import json
@@ -30,7 +34,7 @@ from sqlalchemy import create_engine, text
 from mcp_servers.slack_server import post_notification, request_approval
 from postmortem import write_postmortem
 from state import AgentState
-from tools import lineage_tracer, log_parser, memory_lookup, schema_inspector
+from tools import airflow_client, lineage_tracer, log_parser, memory_lookup, schema_inspector
 
 logger = logging.getLogger("agent.graph")
 
@@ -39,6 +43,19 @@ PIPELINE_DB_CONN = os.environ.get(
     "postgresql+psycopg2://pipeline:pipeline@postgres/fda_pipeline",
 )
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+SLACK_TIMEOUT_MINUTES = int(os.environ.get("SLACK_TIMEOUT_MINUTES", "30"))
+
+# error_type -> severity. Drives approve_or_escalate_node's response
+# strategy (see its docstring) — a separate dimension from risk_level,
+# which only judges whether a specific proposed fix is safe to apply.
+SEVERITY_MAP = {
+    "data_corruption": "P0",
+    "schema_drift": "P1",
+    "volume_anomaly": "P1",
+    "data_quality": "P2",
+    "freshness": "P2",
+    "upstream_failure": "P3",
+}
 
 
 def _engine():
@@ -68,7 +85,8 @@ def ingest_node(state: AgentState) -> dict:
 
 class _ErrorClassification(BaseModel):
     error_type: Literal[
-        "schema_drift", "volume_anomaly", "data_quality", "upstream_failure"
+        "data_corruption", "schema_drift", "volume_anomaly",
+        "data_quality", "freshness", "upstream_failure",
     ] = Field(description="Best-fit category for this pipeline failure.")
     confidence: float = Field(description="0.0-1.0 confidence in this classification.")
     reasoning: str = Field(description="One or two sentences explaining why.")
@@ -86,19 +104,28 @@ def classify_node(state: AgentState) -> dict:
         f"Heuristic keyword-match hint (not authoritative, may be wrong): "
         f"{parsed_log.get('error_type_hint')}\n\n"
         "Classify this into exactly one of:\n"
+        "- data_corruption: existing rows are structurally broken — encoding "
+        "corruption, referential/integrity violations, widespread garbled "
+        "values — as opposed to merely missing/out-of-range ones. This is the "
+        "most severe category: it pauses the pipeline, so only use it when "
+        "the data itself looks damaged, not just imperfect.\n"
         "- schema_drift: a column was renamed, added, or removed\n"
         "- volume_anomaly: row count is unexpectedly high or low\n"
-        "- data_quality: existing rows have bad or missing values\n"
+        "- data_quality: existing rows have bad or missing values (moderate "
+        "null rates, out-of-range values) short of outright corruption\n"
+        "- freshness: data is stale — the pipeline ran but the underlying "
+        "source data didn't actually update\n"
         "- upstream_failure: infra/network/API/storage issue unrelated to "
         "the shape or content of the data (timeouts, missing files, OOM, "
         "connection errors)"
     )
 
     result = _llm().with_structured_output(_ErrorClassification).invoke(prompt)
-    logger.info("classify: error_type=%s confidence=%.2f reasoning=%s",
-                result.error_type, result.confidence, result.reasoning)
+    severity = SEVERITY_MAP.get(result.error_type, "P3")
+    logger.info("classify: error_type=%s severity=%s confidence=%.2f reasoning=%s",
+                result.error_type, severity, result.confidence, result.reasoning)
 
-    return {"error_type": result.error_type}
+    return {"error_type": result.error_type, "severity": severity}
 
 
 # --------------------------------------------------------------------------
@@ -209,6 +236,42 @@ def investigate_node(state: AgentState) -> dict:
             f"({null_check['null_pct']}%) are NULL."
         )
 
+    elif error_type == "data_corruption":
+        # Most severe category — run both checks available rather than
+        # picking one, since corruption can show up as either pattern
+        # (or neither, in which case a human needs to look regardless).
+        tool_used = "null_rate_check+row_count_check"
+        null_check = _check_null_rate()
+        row_check = _check_row_count()
+        details["null_check"] = null_check
+        details["row_count_check"] = row_check
+        summary_parts.append(
+            f"Null-rate check on {null_check['column']}: "
+            f"{null_check['null_rows']}/{null_check['total_rows']} rows "
+            f"({null_check['null_pct']}%) are NULL. Row count check: "
+            f"current={row_check['current_count']} baseline={row_check['baseline_count']} "
+            f"deviation={row_check['deviation_pct']}%."
+        )
+
+    elif error_type == "freshness":
+        tool_used = "freshness_check"
+        with _engine().connect() as conn:
+            freshness_row = conn.execute(text("""
+                SELECT table_name, last_loaded, is_stale
+                FROM monitoring.freshness_checks
+                ORDER BY checked_at DESC LIMIT 1
+            """)).fetchone()
+        freshness = (
+            {"table_name": freshness_row[0], "last_loaded": str(freshness_row[1]),
+             "is_stale": freshness_row[2]}
+            if freshness_row else None
+        )
+        details["freshness"] = freshness
+        summary_parts.append(
+            f"Latest freshness check: {freshness}." if freshness
+            else "No freshness check recorded yet."
+        )
+
     else:
         summary_parts.append(
             "No specialized investigation tool for upstream_failure beyond "
@@ -304,55 +367,121 @@ def _try_auto_fix_schema_drift(investigation: dict) -> Optional[str]:
     return f"Auto-renamed column '{new_name}' back to '{original_name}'."
 
 
+def _retry_airflow_task(alert: dict) -> Optional[str]:
+    """Best-effort: never lets an Airflow API failure break the graph."""
+    try:
+        airflow_client.retry_task(alert["dag_id"], alert["run_id"], alert["task_id"])
+        return f"Retried task '{alert['task_id']}' via the Airflow API."
+    except Exception as exc:
+        logger.warning("Airflow retry_task failed for %s.%s: %s",
+                       alert["dag_id"], alert["task_id"], exc)
+        return None
+
+
 def approve_or_escalate_node(state: AgentState) -> dict:
+    """Severity (P0-P3, from classify_node) drives the response strategy;
+    risk_level (from fix_node) only ever affects message framing here —
+    it no longer gates whether an action is taken, since none of the
+    actions this node takes are LLM-proposed SQL (see module docstring).
+
+      P0 (data corruption): pause the DAG immediately, escalate via
+      Slack now, then via email/re-confirmed-pause on the timeout
+      ladder enforced by escalation_scheduler.py if unacknowledged.
+
+      P1 (schema drift / volume anomaly): apply the narrow safe schema
+      fix immediately if it applies; otherwise send a Slack approval
+      request that auto-applies (retries the task) after
+      SLACK_TIMEOUT_MINUTES if nobody responds.
+
+      P2 (data quality / freshness): retry the task silently, log only
+      — no Slack message at all.
+
+      P3 (upstream/infra): log only, no fix attempted, matching the
+      existing behavior for this category.
+    """
     alert = state["alert"]
     error_type = state.get("error_type", "upstream_failure")
+    severity = state.get("severity") or SEVERITY_MAP.get(error_type, "P3")
     investigation = state.get("investigation", {})
     proposed_fix = state.get("proposed_fix", {})
     risk_level = proposed_fix.get("risk_level", "high")
 
     incident_id = str(uuid.uuid4())
     summary = (
-        f"[{error_type}] {alert['dag_id']}.{alert['task_id']} "
+        f"[{severity}/{error_type}] {alert['dag_id']}.{alert['task_id']} "
         f"(run {alert['run_id']}): {proposed_fix.get('description', '')}"
     )
 
-    if risk_level == "low":
-        detail = "No safe automatic action available for this error type; approved without a DB change."
-
-        if error_type == "schema_drift":
-            try:
-                applied_detail = _try_auto_fix_schema_drift(investigation)
-                if applied_detail:
-                    detail = applied_detail
-            except Exception as exc:
-                logger.error("auto-fix attempt failed: %s", exc)
-                detail = f"Attempted auto-fix failed, needs manual review: {exc}"
+    # ---------------- P0: pause now, escalate now, ladder for the rest ----
+    if severity == "P0":
+        try:
+            airflow_client.pause_dag(alert["dag_id"])
+            pause_detail = f"DAG '{alert['dag_id']}' paused immediately."
+            logger.info("approve_or_escalate: P0 — %s", pause_detail)
+        except Exception as exc:
+            pause_detail = f"Attempted to pause the DAG but the Airflow API call failed: {exc}"
+            logger.error("approve_or_escalate: P0 pause failed: %s", exc)
 
         try:
-            post_notification(f"✅ Auto-resolved: {summary}\n{detail}")
+            post_notification(f"🚨 P0 incident: {summary}\n{pause_detail}")
         except Exception as exc:
             logger.warning("Slack notification failed (non-fatal): %s", exc)
 
-        logger.info("approve_or_escalate: auto_approved. %s", detail)
+        try:
+            request_approval(
+                incident_id=incident_id, summary=summary, risk_level=risk_level,
+                dag_id=alert["dag_id"], run_id=alert["run_id"], task_id=alert["task_id"],
+                severity="P0",
+            )
+        except Exception as exc:
+            logger.warning("Slack approval request failed (non-fatal): %s", exc)
+
+        return {"approval_status": "escalated"}
+
+    # ---------------- P1: safe fix now, else timeout-gated approval -------
+    if severity == "P1":
+        applied_detail = None
+        if error_type == "schema_drift":
+            try:
+                applied_detail = _try_auto_fix_schema_drift(investigation)
+            except Exception as exc:
+                logger.error("auto-fix attempt failed: %s", exc)
+
+        if applied_detail:
+            retry_detail = _retry_airflow_task(alert)
+            detail = applied_detail + (f" {retry_detail}" if retry_detail else "")
+            try:
+                post_notification(f"✅ P1 auto-fixed: {summary}\n{detail}")
+            except Exception as exc:
+                logger.warning("Slack notification failed (non-fatal): %s", exc)
+            logger.info("approve_or_escalate: P1 auto_approved. %s", detail)
+            return {"approval_status": "auto_approved"}
+
+        # No mechanical fix available (e.g. volume_anomaly, or a schema
+        # diff too ambiguous to auto-rename) — ask, but don't block on
+        # an answer: escalation_scheduler retries the task on our behalf
+        # after SLACK_TIMEOUT_MINUTES if nobody responds.
+        try:
+            request_approval(
+                incident_id=incident_id, summary=summary, risk_level=risk_level,
+                dag_id=alert["dag_id"], run_id=alert["run_id"], task_id=alert["task_id"],
+                severity="P1", timeout_minutes=SLACK_TIMEOUT_MINUTES,
+            )
+        except Exception as exc:
+            logger.warning("Slack approval request failed (non-fatal): %s", exc)
+
+        logger.info("approve_or_escalate: P1 pending (incident_id=%s)", incident_id)
+        return {"approval_status": "pending"}
+
+    # ---------------- P2: silent auto-fix, no Slack ------------------------
+    if severity == "P2":
+        retry_detail = _retry_airflow_task(alert)
+        logger.info("approve_or_escalate: P2 auto_approved (silent). %s", retry_detail)
         return {"approval_status": "auto_approved"}
 
-    # medium and high risk always go to a human via Slack; the agent never
-    # applies the fix itself in either case.
-    try:
-        request_approval(
-            incident_id=incident_id,
-            summary=summary,
-            risk_level=risk_level,
-            dag_id=alert["dag_id"],
-            task_id=alert["task_id"],
-        )
-    except Exception as exc:
-        logger.warning("Slack approval request failed (non-fatal): %s", exc)
-
-    status = "escalated" if risk_level == "high" else "pending"
-    logger.info("approve_or_escalate: %s (incident_id=%s)", status, incident_id)
-    return {"approval_status": status}
+    # ---------------- P3: log only ------------------------------------------
+    logger.info("approve_or_escalate: P3 — logged only, no fix attempted.")
+    return {"approval_status": "auto_approved"}
 
 
 # --------------------------------------------------------------------------
