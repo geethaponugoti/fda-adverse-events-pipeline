@@ -4,6 +4,12 @@ Pulls real data from the openFDA API (quarterly updates, last updated April 2026
 No agent code in Part 1.
 """
 
+# apache/airflow:2.8.1 ships Python 3.8, which doesn't support PEP 585
+# subscripted builtin generics (tuple[X, Y], dict[K, V], etc.) as actual
+# runtime expressions — only as strings. This defers all annotation
+# evaluation so those forms are safe to use below regardless.
+from __future__ import annotations
+
 import datetime
 import logging
 import os
