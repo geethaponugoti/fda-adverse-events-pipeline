@@ -18,6 +18,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy import create_engine, text
 
 from airflow import DAG
+from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
@@ -30,6 +31,12 @@ PIPELINE_DB_CONN = os.environ.get(
 )
 
 DBT_PROJECT_DIR = os.environ.get("DBT_PROJECT_DIR", "/opt/airflow/dbt_project")
+
+# Self-healing agent now runs on its own EC2 instance (separate from
+# Airflow), not as a sibling container reachable via Docker DNS — so this
+# is a real network address, not a Docker service name. Uses the agent
+# host's private IP (stable across stop/start, unlike its public IP).
+AGENT_ALERT_URL = os.environ.get("AGENT_ALERT_URL", "http://172.31.41.43:8000/alert")
 
 S3_BUCKET = "pipeline-fda"
 
@@ -242,31 +249,17 @@ def extract_fda_data(**context):
         s3_key = f"raw/fda_events_{load_date}.csv"
 
         with _engine().begin() as conn:
-            existing_count = conn.execute(text(
-                "SELECT COUNT(*) FROM raw.fda_adverse_events WHERE load_date = :d"
-            ), {"d": load_date}).scalar_one()
-
-        if existing_count > 0:
-            if _s3_object_exists(s3_key):
-                logger.info("data already loaded for today, skipping")
-
-                context["ti"].xcom_push(key="s3_key",    value=s3_key)
-                context["ti"].xcom_push(key="row_count", value=existing_count)
-                context["ti"].xcom_push(key="load_date", value=load_date)
-
-                _log_finish(run_row_id, "success", rows_processed=existing_count)
-                return
-            else:
-                logger.warning(
-                    "raw.fda_adverse_events has %d rows for load_date=%s but "
-                    "s3://%s/%s is missing — re-fetching instead of skipping",
-                    existing_count, load_date, S3_BUCKET, s3_key
-                )
+            already_loaded = conn.execute(text(
+                "SELECT COUNT(*) FROM raw.fda_adverse_events"
+            )).scalar_one()
 
         all_rows = []
-        skip     = 0
+        skip     = already_loaded
 
-        logger.info("Fetching FDA adverse events for range 2025-01-01 to 2025-12-31")
+        logger.info(
+            "Fetching FDA adverse events for range %s, starting at skip=%d "
+            "(%d records already loaded)", FDA_DATE_RANGE, skip, already_loaded
+        )
 
         for page in range(MAX_PAGES):
             params = {
@@ -299,7 +292,14 @@ def extract_fda_data(**context):
                 break
 
         if not all_rows:
-            raise ValueError("Zero rows extracted from FDA API — check date range")
+            logger.warning(
+                "No new records returned from FDA API at skip=%d — "
+                "date range is fully paginated, nothing to load", skip
+            )
+            _log_finish(run_row_id, "success", rows_processed=0)
+            raise AirflowSkipException(
+                "No new FDA records to extract; skipping downstream tasks"
+            )
 
         df = pd.DataFrame(all_rows)
 
@@ -323,6 +323,9 @@ def extract_fda_data(**context):
         context["ti"].xcom_push(key="load_date", value=load_date)
 
         _log_finish(run_row_id, "success", rows_processed=len(df))
+
+    except AirflowSkipException:
+        raise
 
     except Exception as exc:
         _log_finish(run_row_id, "failed", error_message=str(exc))
@@ -353,20 +356,33 @@ def validate_raw_schema(**context):
             )
 
         with _engine().begin() as conn:
+            live_columns = conn.execute(text("""
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = 'raw' AND table_name = 'fda_adverse_events'
+            """)).fetchall()
+
             conn.execute(text(
                 "DELETE FROM monitoring.schema_snapshots "
                 "WHERE table_name = 'fda_adverse_events'"
             ))
-            for col in actual_cols:
+            for column_name, data_type, is_nullable in live_columns:
                 conn.execute(text("""
                     INSERT INTO monitoring.schema_snapshots
                         (table_name, schema_name, column_name,
                          data_type, is_nullable)
                     VALUES ('fda_adverse_events', 'raw',
-                            :col, 'varchar', 'YES')
-                """), {"col": col})
+                            :col, :data_type, :is_nullable)
+                """), {
+                    "col": column_name,
+                    "data_type": data_type,
+                    "is_nullable": is_nullable,
+                })
 
-        logger.info("Schema validation passed. Columns: %s", sorted(actual_cols))
+        logger.info(
+            "Schema validation passed. CSV columns: %s. Live table schema snapshotted: %s",
+            sorted(actual_cols), sorted(c[0] for c in live_columns)
+        )
         _log_finish(run_row_id, "success")
 
     except Exception as exc:
@@ -497,18 +513,40 @@ def trigger_dbt_run(**context):
         raise
 
 
+def alert_agent(context):
+    """on_failure_callback: notifies the self-healing agent (agent/main.py,
+    POST /alert) whenever a task in this DAG fails. Best-effort only — a
+    down or slow agent must never block or fail the pipeline itself, so
+    failures here are logged and swallowed rather than raised."""
+    exception = context.get("exception")
+    try:
+        requests.post(
+            AGENT_ALERT_URL,
+            json={
+                "dag_id":     context["dag"].dag_id,
+                "run_id":     context["run_id"],
+                "task_id":    context["task_instance"].task_id,
+                "log_text":   str(exception) if exception else None,
+                "error_type": type(exception).__name__ if exception else None,
+            },
+            timeout=5,
+        )
+    except Exception as exc:
+        logger.warning("alert_agent: failed to notify self-healing agent: %s", exc)
+
+
 default_args = {
     "owner":               "Geetha",
     "retries":             1,
     "retry_delay":         datetime.timedelta(minutes=2),
-    "on_failure_callback": None,
+    "on_failure_callback": alert_agent,
 }
 
 with DAG(
     dag_id="fda_pipeline_dag",
     description="FDA adverse event reports — extract, validate, load, transform.",
     default_args=default_args,
-    schedule="*/15 * * * *",
+    schedule="0 */2 * * *",
     start_date=datetime.datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,

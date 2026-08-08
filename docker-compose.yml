@@ -13,7 +13,15 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__WEBSERVER__WORKERS: "1"
     PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
+    PIPELINE_DB_HOST: ${PIPELINE_DB_HOST}
+    PIPELINE_DB_PORT: ${PIPELINE_DB_PORT}
+    PIPELINE_DB_USER: ${PIPELINE_DB_USER}
+    PIPELINE_DB_PASSWORD: ${PIPELINE_DB_PASSWORD}
+    PIPELINE_DB_NAME: ${PIPELINE_DB_NAME}
     AWS_DEFAULT_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AGENT_ALERT_URL: ${AGENT_ALERT_URL}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./scripts:/opt/airflow/scripts
@@ -61,27 +69,6 @@ services:
       PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
     volumes:
       - ./scripts:/app/scripts
-
-  agent:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.agent
-    ports:
-      - "8000:8000"
-    environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
-      SLACK_CHANNEL: ${SLACK_CHANNEL}
-      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
-      PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
-      S3_BUCKET: pipeline-fda
-      AWS_DEFAULT_REGION: us-east-1
-      QDRANT_URL: ${QDRANT_URL}
-      QDRANT_API_KEY: ${QDRANT_API_KEY}
-      DBT_MANIFEST_PATH: /dbt_project/target/manifest.json
-    volumes:
-      - ~/.aws:/root/.aws:ro
-      - ./dbt_project:/dbt_project:ro
 
 volumes:
   airflow_logs:

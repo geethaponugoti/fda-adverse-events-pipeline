@@ -1,0 +1,30 @@
+version: "3.8"
+
+# Standalone compose file for the self-healing agent, deployed on its own
+# EC2 instance separate from Airflow/Streamlit (see docker-compose.yml).
+# Run with: docker-compose -f docker-compose.agent.yml up -d
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_CHANNEL: ${SLACK_CHANNEL}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
+      PIPELINE_DB_CONN: ${PIPELINE_DB_CONN}
+      S3_BUCKET: pipeline-fda
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      QDRANT_URL: ${QDRANT_URL}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      DBT_MANIFEST_PATH: /dbt_project/target/manifest.json
+    volumes:
+      - ~/.aws:/root/.aws:ro
+      - ./dbt_project:/dbt_project:ro
+    restart: unless-stopped

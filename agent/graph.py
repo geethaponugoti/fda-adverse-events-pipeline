@@ -175,7 +175,11 @@ def investigate_node(state: AgentState) -> dict:
         if len(diff.get("added", [])) == 1 and len(diff.get("removed", [])) == 1:
             changed_column = diff["removed"][0]
 
-        lineage = lineage_tracer.get_impacted_models(column_name=changed_column)
+        try:
+            lineage = lineage_tracer.get_impacted_models(column_name=changed_column)
+        except FileNotFoundError as exc:
+            logger.warning("lineage_tracer unavailable, continuing without it: %s", exc)
+            lineage = {"source_found": False, "impacted_models": [], "models_referencing_column": []}
         details["lineage"] = lineage
 
         summary_parts.append(
