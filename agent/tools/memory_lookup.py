@@ -14,7 +14,14 @@ from functools import lru_cache
 from typing import Optional
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
+from qdrant_client.http.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PayloadSchemaType,
+    VectorParams,
+)
 from sentence_transformers import SentenceTransformer
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -48,6 +55,17 @@ def ensure_collection() -> None:
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
         )
+    # find_reusable_fix() filters on has_sql_fix — Qdrant rejects a
+    # filter on any payload field with no index for it (400 Bad
+    # Request), which would otherwise make every reuse lookup silently
+    # fail over to a fresh (paid) OpenAI call. create_payload_index is
+    # a no-op if the index already exists, so safe to call every time,
+    # same as this function's own create_collection check above.
+    client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="has_sql_fix",
+        field_schema=PayloadSchemaType.BOOL,
+    )
 
 
 def search_similar_incidents(query_text: str, top_k: int = 3) -> list:
