@@ -103,6 +103,27 @@ def get_schema_diff(
     }
 
 
+def get_current_columns(
+    schema_name: str = "raw", table_name: str = "fda_adverse_events"
+) -> dict:
+    """Public wrapper around _current_columns() — live schema context
+    for the LLM fix-generation prompt in graph.py's fix_node."""
+    with _engine().connect() as conn:
+        return _current_columns(conn, schema_name, table_name)
+
+
+def get_previous_snapshot(
+    schema_name: str = "raw", table_name: str = "fda_adverse_events"
+) -> Optional[dict]:
+    """Public wrapper around _latest_snapshot() — same caveat as
+    get_schema_diff(): this is the last snapshot batch, which can
+    itself already reflect a drift (see find_safe_rename()'s
+    docstring). Still useful as LLM context ("here's what it used to
+    look like"), just not a safe basis for auto-executing anything."""
+    with _engine().connect() as conn:
+        return _latest_snapshot(conn, schema_name, table_name)
+
+
 def find_safe_rename(
     schema_name: str = "raw", table_name: str = "fda_adverse_events"
 ) -> Optional[tuple]:

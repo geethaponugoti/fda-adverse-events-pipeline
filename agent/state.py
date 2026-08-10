@@ -57,6 +57,13 @@ class ProposedFix(TypedDict):
     risk_level: RiskLevel
     sql: Optional[str]
     auto_applicable: bool
+    # Where this proposal came from — "mechanical" (the deterministic,
+    # information_schema-verified rename), "qdrant_reuse" (a prior
+    # incident's fix that worked), "llm" (a fresh OpenAI proposal), or
+    # "none" (no fix attempted, e.g. P3). Purely for observability —
+    # tools/sql_validator.py's classification, not this field, is what
+    # actually gates execution.
+    source: str
 
 
 class Postmortem(TypedDict):
@@ -73,6 +80,9 @@ class Postmortem(TypedDict):
     resolution: str
     risk_level: Optional[RiskLevel]
     approval_status: ApprovalStatus
+    sql: Optional[str]
+    sql_tier: Optional[str]
+    has_sql_fix: bool
 
 
 class AgentState(TypedDict, total=False):
@@ -87,4 +97,13 @@ class AgentState(TypedDict, total=False):
     investigation: InvestigationFindings
     proposed_fix: ProposedFix
     approval_status: ApprovalStatus
+    # True only if proposed_fix.sql (or the re-derived verified rename
+    # for the AUTO_EXECUTABLE tier) actually ran against the database —
+    # approval_status alone doesn't distinguish that from "the graph
+    # completed successfully via a plain retry with no SQL executed at
+    # all" (e.g. a P1 auto-fix that fell back to retry-only because the
+    # proposed rename no longer applied). postmortem.py uses this, not
+    # approval_status, to decide whether a fix is safe to cache in
+    # Qdrant for future reuse.
+    fix_executed: Optional[bool]
     postmortem: Postmortem

@@ -22,7 +22,7 @@ import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import create_engine, text
 
-from mcp_servers.slack_server import post_notification
+from mcp_servers.slack_server import post_notification, resolve_approved_fix
 from tools import airflow_client, email_notifier
 
 logger = logging.getLogger("agent.escalation_scheduler")
@@ -48,10 +48,11 @@ def _handle_p1_timeout(conn, row) -> None:
         "Auto-applying P1 fix for incident %s after %.0f min with no response",
         row.incident_id, row.age_minutes,
     )
-    try:
-        airflow_client.retry_task(row.dag_id, row.run_id, row.task_id)
-    except Exception as exc:
-        logger.warning("Airflow retry failed for incident %s: %s", row.incident_id, exc)
+    # Same execute-then-retry path a human triggers by clicking Approve
+    # in Slack — see resolve_approved_fix()'s docstring. It re-validates
+    # row.proposed_sql via sql_validator itself rather than trusting
+    # whatever tier it was classified as when the approval was created.
+    detail = resolve_approved_fix(row.proposed_sql, row.dag_id, row.run_id, row.task_id)
 
     conn.execute(text("""
         UPDATE monitoring.agent_approvals
@@ -61,7 +62,8 @@ def _handle_p1_timeout(conn, row) -> None:
 
     try:
         post_notification(
-            f"⏱️ No response in {SLACK_TIMEOUT_MINUTES} min — auto-applied P1 fix: {row.summary}"
+            f"⏱️ No response in {SLACK_TIMEOUT_MINUTES} min — auto-applied P1 fix: "
+            f"{row.summary}\n{detail}"
         )
     except Exception as exc:
         logger.warning("Slack notification failed for incident %s: %s", row.incident_id, exc)
@@ -106,7 +108,7 @@ def check_escalations() -> None:
         with _engine().begin() as conn:
             pending = conn.execute(text("""
                 SELECT incident_id, dag_id, run_id, task_id, summary, severity,
-                       escalation_email_sent_at, dag_paused_at,
+                       proposed_sql, escalation_email_sent_at, dag_paused_at,
                        EXTRACT(EPOCH FROM (NOW() - created_at)) / 60 AS age_minutes
                 FROM monitoring.agent_approvals
                 WHERE status = 'pending'

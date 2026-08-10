@@ -31,7 +31,7 @@ from sqlalchemy import create_engine, text
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from tools import airflow_client, schema_inspector
+from tools import airflow_client, schema_inspector, sql_validator
 
 logger = logging.getLogger("agent.slack_server")
 
@@ -76,23 +76,26 @@ def _ensure_approvals_table() -> None:
                 ADD COLUMN IF NOT EXISTS run_id VARCHAR(200),
                 ADD COLUMN IF NOT EXISTS severity VARCHAR(10),
                 ADD COLUMN IF NOT EXISTS escalation_email_sent_at TIMESTAMP,
-                ADD COLUMN IF NOT EXISTS dag_paused_at TIMESTAMP
+                ADD COLUMN IF NOT EXISTS dag_paused_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS proposed_sql TEXT
         """))
 
 
 def _insert_pending(
     incident_id: str, summary: str, risk_level: str,
     dag_id: str, run_id: str, task_id: str, severity: str,
+    proposed_sql: str = None,
 ) -> None:
     with _engine().begin() as conn:
         conn.execute(text("""
             INSERT INTO monitoring.agent_approvals
-                (incident_id, dag_id, run_id, task_id, summary, risk_level, severity, status)
-            VALUES (:incident_id, :dag_id, :run_id, :task_id, :summary, :risk_level, :severity, 'pending')
+                (incident_id, dag_id, run_id, task_id, summary, risk_level, severity, proposed_sql, status)
+            VALUES (:incident_id, :dag_id, :run_id, :task_id, :summary, :risk_level, :severity, :proposed_sql, 'pending')
             ON CONFLICT (incident_id) DO UPDATE SET
-                summary    = EXCLUDED.summary,
-                risk_level = EXCLUDED.risk_level,
-                severity   = EXCLUDED.severity
+                summary      = EXCLUDED.summary,
+                risk_level   = EXCLUDED.risk_level,
+                severity     = EXCLUDED.severity,
+                proposed_sql = EXCLUDED.proposed_sql
         """), {
             "incident_id": incident_id,
             "dag_id": dag_id,
@@ -101,6 +104,7 @@ def _insert_pending(
             "summary": summary,
             "risk_level": risk_level,
             "severity": severity,
+            "proposed_sql": proposed_sql,
         })
 
 
@@ -116,7 +120,7 @@ def _update_approval_status(incident_id: str, status: str, resolved_by: str) -> 
 def _get_approval(incident_id: str):
     with _engine().connect() as conn:
         return conn.execute(text("""
-            SELECT dag_id, run_id, task_id, severity
+            SELECT dag_id, run_id, task_id, severity, proposed_sql
             FROM monitoring.agent_approvals WHERE incident_id = :incident_id
         """), {"incident_id": incident_id}).fetchone()
 
@@ -147,9 +151,15 @@ def request_approval(
     task_id: str = "",
     severity: str = "",
     timeout_minutes: int = 0,
+    proposed_sql: str = None,
 ) -> dict:
     """Posts an incident to Slack with Approve/Reject buttons and records
     it as pending in monitoring.agent_approvals.
+
+    proposed_sql (if any) is included in the message so a human can
+    review the *exact* statement before clicking Approve — and is
+    what actually gets executed on approval (see
+    resolve_approved_fix()), not re-derived from scratch.
 
     severity/timeout_minutes only change the message framing — the
     escalation_scheduler (not this function) is what actually enforces
@@ -157,7 +167,7 @@ def request_approval(
     monitoring.agent_approvals for rows still 'pending' past their
     deadline."""
     _ensure_approvals_table()
-    _insert_pending(incident_id, summary, risk_level, dag_id, run_id, task_id, severity)
+    _insert_pending(incident_id, summary, risk_level, dag_id, run_id, task_id, severity, proposed_sql)
 
     if severity == "P0":
         urgency = "🚨 P0 — DAG PAUSED — urgent response required"
@@ -169,6 +179,7 @@ def request_approval(
         urgency = "⚠️ Review needed"
 
     message_text = f"{urgency}: {summary}"
+    sql_block_text = f"\n*Proposed SQL:*\n```{proposed_sql}```" if proposed_sql else ""
     blocks = [
         {
             "type": "section",
@@ -177,6 +188,7 @@ def request_approval(
                 "text": (
                     f"*{urgency}*\n{summary}\n"
                     f"_dag: `{dag_id}` task: `{task_id}` incident: `{incident_id}`_"
+                    f"{sql_block_text}"
                 ),
             },
         },
@@ -261,6 +273,58 @@ def _verify_slack_signature(raw_body: bytes, timestamp: str, signature: str) -> 
     return hmac.compare_digest(computed_signature, signature)
 
 
+def _try_retry(dag_id: str, run_id: str, task_id: str) -> str:
+    try:
+        airflow_client.retry_task(dag_id, run_id, task_id)
+        return "Task retried — pipeline resuming."
+    except Exception as exc:
+        logger.warning("Airflow retry_task failed for %s.%s: %s", dag_id, task_id, exc)
+        return "⚠️ Retry call failed."
+
+
+def resolve_approved_fix(proposed_sql, dag_id: str, run_id: str, task_id: str) -> str:
+    """Shared by handle_slack_action (human clicked Approve) and
+    escalation_scheduler (P1 unanswered past its timeout) — executes
+    whatever fix is warranted, then retries the task, and returns a
+    human-readable summary of what happened.
+
+    Re-classifies proposed_sql via sql_validator immediately before
+    doing anything with it, rather than trusting whatever
+    classification happened when the approval was first requested —
+    defense in depth against a stale value. AUTO_EXECUTABLE (a rename)
+    still never runs the literal text directly, same as everywhere
+    else in this agent; NEEDS_APPROVAL runs the exact text a human
+    already reviewed and approved."""
+    if not proposed_sql:
+        return _try_retry(dag_id, run_id, task_id)
+
+    classification = sql_validator.classify_sql(proposed_sql)
+
+    if classification.tier == sql_validator.SqlTier.REJECTED:
+        return (
+            f"Refused to execute — reclassified as unsafe on re-check "
+            f"({classification.reason}). Not retried either; this needs "
+            f"manual intervention."
+        )
+
+    fix_detail = None
+    try:
+        if classification.tier == sql_validator.SqlTier.AUTO_EXECUTABLE:
+            fix_detail = schema_inspector.apply_safe_rename_fix()
+        else:  # NEEDS_APPROVAL — a human explicitly approved this exact text
+            with _engine().begin() as conn:
+                conn.execute(text(proposed_sql))
+            fix_detail = f"Executed approved SQL: {proposed_sql}"
+    except Exception as exc:
+        logger.error("Fix execution failed for %s.%s: %s", dag_id, task_id, exc)
+        return f"⚠️ Fix execution failed: {exc}"
+
+    retry_detail = _try_retry(dag_id, run_id, task_id)
+    if fix_detail:
+        return f"✅ {fix_detail} {retry_detail}"
+    return retry_detail + " (proposed fix no longer applied)"
+
+
 async def handle_slack_action(raw_body: bytes, timestamp: str, signature: str) -> tuple:
     """Core handler for Slack's interactivity request (Approve/Reject
     button clicks): verifies the request came from Slack, records the
@@ -290,37 +354,18 @@ async def handle_slack_action(raw_body: bytes, timestamp: str, signature: str) -
     approval = _get_approval(incident_id)
     _update_approval_status(incident_id, new_status, user)
 
-    # Approving a P1 (no mechanical fix was applied yet — graph.py already
-    # applies it immediately and skips the approval request entirely when
-    # it can) means "apply the fix, then retry" — the same two actions
-    # escalation_scheduler takes on timeout, just triggered by a human
-    # instead of the clock. The fix must run BEFORE the retry, or the
-    # retried task just fails again with the same error it started with.
+    # Approving a P0 is just acknowledgment — the DAG was already
+    # paused immediately on detection (see graph.py), nothing to
+    # execute here regardless of severity for that case. P1/P2
+    # approval means "apply the fix, then retry" — the same two
+    # actions escalation_scheduler takes on a P1 timeout, just
+    # triggered by a human instead of the clock.
     result_note = ""
-    if new_status == "approved" and approval is not None and approval.severity == "P1":
-        fix_detail = None
-        try:
-            fix_detail = schema_inspector.apply_safe_rename_fix()
-        except Exception as exc:
-            logger.error("apply_safe_rename_fix failed after Slack approval for %s: %s",
-                         incident_id, exc)
-
-        retry_ok = True
-        try:
-            airflow_client.retry_task(approval.dag_id, approval.run_id, approval.task_id)
-        except Exception as exc:
-            retry_ok = False
-            logger.warning("Airflow retry_task failed after Slack approval for %s: %s",
-                           incident_id, exc)
-
-        if fix_detail and retry_ok:
-            result_note = f"\n✅ Fixed: {fix_detail} Task retried — pipeline resuming."
-        elif fix_detail and not retry_ok:
-            result_note = f"\n✅ Fixed: {fix_detail} ⚠️ Retry call failed — retry manually."
-        elif retry_ok:
-            result_note = "\nTask retried (no schema fix was found to apply)."
-        else:
-            result_note = "\n⚠️ Retry call failed."
+    if new_status == "approved" and approval is not None and approval.severity in ("P1", "P2"):
+        detail = resolve_approved_fix(
+            approval.proposed_sql, approval.dag_id, approval.run_id, approval.task_id
+        )
+        result_note = f"\n{detail}"
 
     response_url = payload.get("response_url")
     if response_url:

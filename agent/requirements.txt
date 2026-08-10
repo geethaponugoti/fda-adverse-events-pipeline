@@ -15,3 +15,4 @@ pydantic
 httpx
 fastmcp
 apscheduler
+sqlparse

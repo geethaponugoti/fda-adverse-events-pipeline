@@ -11,9 +11,10 @@ same collection this reads from.
 
 import os
 from functools import lru_cache
+from typing import Optional
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+from qdrant_client.http.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
 from sentence_transformers import SentenceTransformer
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -79,3 +80,37 @@ def search_similar_incidents(query_text: str, top_k: int = 3) -> list:
         }
         for hit in hits
     ]
+
+
+def find_reusable_fix(query_text: str, min_score: float = 0.85) -> Optional[dict]:
+    """Looks for a prior incident whose fix actually worked
+    (postmortem.py only sets has_sql_fix=True when the SQL was
+    executed successfully — auto_approved or human-approved, never
+    rejected/pending) and is similar enough to be worth reusing
+    instead of asking OpenAI again. None if nothing clears min_score —
+    a mediocre match reused blindly is worse than a fresh proposal."""
+    ensure_collection()
+    client = get_qdrant_client()
+    query_vector = embed_text(query_text)
+
+    hits = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        limit=1,
+        query_filter=Filter(must=[
+            FieldCondition(key="has_sql_fix", match=MatchValue(value=True))
+        ]),
+    ).points
+
+    if not hits or hits[0].score < min_score:
+        return None
+
+    hit = hits[0]
+    return {
+        "score": hit.score,
+        "incident_id": hit.payload.get("incident_id"),
+        "description": hit.payload.get("resolution"),
+        "sql": hit.payload.get("sql"),
+        "sql_tier": hit.payload.get("sql_tier"),
+        "risk_level": hit.payload.get("risk_level"),
+    }

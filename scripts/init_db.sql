@@ -95,6 +95,7 @@ CREATE TABLE monitoring.incident_reports (
     fix_attempted  TEXT,
     fix_result     VARCHAR(50),
     approved       BOOLEAN,
+    fix_sql        TEXT,
     created_at     TIMESTAMP DEFAULT NOW()
 );
 
@@ -110,6 +111,7 @@ CREATE TABLE monitoring.agent_approvals (
     summary                   TEXT,
     risk_level                VARCHAR(20),
     severity                  VARCHAR(10),
+    proposed_sql              TEXT,
     status                    VARCHAR(20) NOT NULL DEFAULT 'pending',
     created_at                TIMESTAMP DEFAULT NOW(),
     resolved_at               TIMESTAMP,

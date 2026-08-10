@@ -21,6 +21,7 @@ import uuid
 from qdrant_client.http.models import PointStruct
 from sqlalchemy import create_engine, text
 
+from tools import sql_validator
 from tools.memory_lookup import (
     COLLECTION_NAME,
     embed_text,
@@ -52,10 +53,16 @@ def _build_summary(state: dict) -> str:
 def _insert_incident_report(state: dict, postmortem: dict) -> None:
     """monitoring.incident_reports' actual live schema is
     (dag_id, run_id, task_id, error_type, error_message, fix_attempted,
-    fix_result, approved, created_at) — no incident_id/failure_type/
-    root_cause/fix_applied/fix_status/duration_seconds/postmortem_text.
-    Column names here must match that, not the postmortem dict's own
-    (differently-named) keys."""
+    fix_result, approved, created_at, fix_sql) — no incident_id/
+    failure_type/root_cause/fix_applied/fix_status/duration_seconds/
+    postmortem_text. Column names here must match that, not the
+    postmortem dict's own (differently-named) keys.
+
+    fix_sql is nullable and only added via ALTER TABLE IF NOT EXISTS in
+    scripts/init_db.sql / applied directly to the live DB — this insert
+    doesn't try to create it itself, unlike agent_approvals' pattern
+    elsewhere, since this table's column additions have historically
+    been done as a one-time migration rather than an ensure-on-every-call."""
     approval_status = postmortem["approval_status"]
     approved = (
         True if approval_status in ("auto_approved", "approved")
@@ -63,14 +70,15 @@ def _insert_incident_report(state: dict, postmortem: dict) -> None:
         else None  # pending / escalated: not yet decided
     )
     parsed_log = state.get("parsed_log") or {}
+    proposed_fix = state.get("proposed_fix") or {}
 
     with _engine().begin() as conn:
         conn.execute(text("""
             INSERT INTO monitoring.incident_reports
                 (dag_id, run_id, task_id, error_type, error_message,
-                 fix_attempted, fix_result, approved, created_at)
+                 fix_attempted, fix_result, approved, fix_sql, created_at)
             VALUES (:dag_id, :run_id, :task_id, :error_type, :error_message,
-                    :fix_attempted, :fix_result, :approved, NOW())
+                    :fix_attempted, :fix_result, :approved, :fix_sql, NOW())
         """), {
             "dag_id": postmortem["dag_id"],
             "run_id": postmortem["run_id"],
@@ -80,6 +88,7 @@ def _insert_incident_report(state: dict, postmortem: dict) -> None:
             "fix_attempted": postmortem["resolution"],
             "fix_result": approval_status,
             "approved": approved,
+            "fix_sql": proposed_fix.get("sql"),
         })
 
 
@@ -97,6 +106,19 @@ def write_postmortem(state: dict) -> dict:
     root_cause = investigation.get("summary") or "No investigation summary available."
     resolution = proposed_fix.get("description") or "No fix proposed."
 
+    # has_sql_fix gates Qdrant reuse (see memory_lookup.find_reusable_fix)
+    # — deliberately keyed on fix_executed, not approval_status. A P1
+    # auto-fix that fell back to a plain retry still resolves as
+    # "auto_approved" but never actually ran any SQL; caching that as
+    # a reusable fix would make future incidents worse, not better.
+    fix_executed = bool(state.get("fix_executed"))
+    sql = proposed_fix.get("sql")
+    has_sql_fix = fix_executed and bool(sql)
+    # Re-classified fresh rather than trusting whatever tier applied at
+    # execution time — matches memory_lookup.find_reusable_fix's payload
+    # contract (it reads "sql_tier" back out for a reused fix's metadata).
+    sql_tier = sql_validator.classify_sql(sql).tier.value if sql else None
+
     postmortem = {
         "incident_id": incident_id,
         "created_at": created_at,
@@ -109,6 +131,9 @@ def write_postmortem(state: dict) -> dict:
         "resolution": resolution,
         "risk_level": proposed_fix.get("risk_level"),
         "approval_status": state.get("approval_status", "pending"),
+        "sql": sql,
+        "sql_tier": sql_tier,
+        "has_sql_fix": has_sql_fix,
     }
 
     ensure_collection()

@@ -7,17 +7,37 @@ P0-P3, computed in classify_node from error_type via SEVERITY_MAP):
 
     ingest -> classify -> investigate -> fix -> approve_or_escalate -> postmortem
 
-Safety note: the `fix` node asks the LLM to propose SQL, but that SQL
-is advisory only — it's surfaced to a human in Slack / the postmortem,
-never executed, regardless of severity. The only DB write
-approve_or_escalate ever makes automatically is a single,
-narrowly-scoped case: renaming a column back to its pre-drift name,
-and only when schema_inspector found exactly one column added and
-exactly one removed (an unambiguous rename), with the identifiers
-coming from information_schema / monitoring.schema_snapshots — not
-from LLM output. Every other "auto-fix" action is a retry of the
-Airflow task via airflow_client, which is safe regardless of what
-caused the original failure.
+Safety note — read this before changing fix_node or
+approve_or_escalate_node: fix_node can now propose LLM-generated SQL
+(not just advisory text), but no proposed SQL is ever trusted just
+because an LLM wrote it. tools/sql_validator.py structurally classifies
+every proposal — statement type, single-vs-multi-statement, WHERE
+clause presence, table allowlist — into three tiers, and that
+classification (not the LLM's own risk_level self-assessment) is what
+approve_or_escalate_node actually acts on:
+
+  REJECTED       — never executed, never even offered for Slack
+                   approval (DROP/TRUNCATE/DELETE-without-WHERE/
+                   multi-statement/out-of-scope-table).
+  NEEDS_APPROVAL — always goes to a human in Slack with the exact SQL
+                   shown (ALTER TABLE beyond a rename, UPDATE, INSERT,
+                   DELETE with WHERE) — even for P2, which otherwise
+                   handles things silently; a real data mutation isn't
+                   "no real risk" just because its error category is.
+  AUTO_EXECUTABLE — the one form this can ever be: ALTER TABLE ...
+                   RENAME COLUMN. Even then, the literal proposed SQL
+                   text still isn't what runs — approve_or_escalate_node
+                   re-derives and verifies the rename against live
+                   information_schema via schema_inspector before
+                   executing anything, same invariant this project has
+                   held since the very first version of this fix.
+                   Qdrant-reused or LLM-authored identifiers are never
+                   trusted directly, only used as a signal that a
+                   rename might be needed.
+
+Every other "auto-fix" action is a retry of the Airflow task via
+airflow_client, which is safe regardless of what caused the original
+failure.
 """
 
 import json
@@ -34,7 +54,7 @@ from sqlalchemy import create_engine, text
 from mcp_servers.slack_server import post_notification, request_approval
 from postmortem import write_postmortem
 from state import AgentState
-from tools import airflow_client, lineage_tracer, log_parser, memory_lookup, schema_inspector
+from tools import airflow_client, lineage_tracer, log_parser, memory_lookup, schema_inspector, sql_validator
 
 logger = logging.getLogger("agent.graph")
 
@@ -304,38 +324,136 @@ class _ProposedFixLLM(BaseModel):
     sql: Optional[str] = Field(
         default=None,
         description=(
-            "Suggested corrective SQL, for a human to review only. This is "
-            "never executed automatically, regardless of risk_level."
+            "A single corrective SQL statement, if one is genuinely "
+            "warranted — otherwise leave this empty and explain why in the "
+            "description. This is NOT trusted or executed as-is: "
+            "tools/sql_validator.py structurally classifies it afterward "
+            "(safe to auto-run / needs a human's approval in Slack / "
+            "rejected outright) regardless of what you say here. Propose "
+            "exactly one statement — no semicolon-separated chains, those "
+            "are rejected automatically — touching only "
+            "raw.fda_adverse_events or a monitoring.* table; anything else "
+            "is rejected too."
         ),
     )
-    auto_applicable: bool = Field(
-        description="True only if you are confident this is safe to apply without human review."
-    )
+
+
+def _try_reuse_prior_fix(error_message: str) -> Optional[dict]:
+    try:
+        return memory_lookup.find_reusable_fix(error_message)
+    except Exception as exc:
+        logger.warning("find_reusable_fix failed, continuing without reuse: %s", exc)
+        return None
 
 
 def fix_node(state: AgentState) -> dict:
+    """Three ways a fix gets proposed here, tried in order — each one
+    is free/safer than the one behind it, so later options only run
+    when the earlier ones don't apply:
+
+      1. Mechanical (schema_drift only): schema_inspector's
+         information_schema-verified rename, when the drift is
+         unambiguous. Instant, free, and the only source whose exact
+         SQL text is ever trusted enough to auto-execute — see the
+         module docstring for why.
+      2. Qdrant reuse: a semantically similar prior incident whose fix
+         actually worked. Saves an OpenAI call.
+      3. Fresh OpenAI generation, given the live schema, the last
+         snapshot, and the investigation findings as context.
+
+    Whatever comes out of this node is still just a *proposal* —
+    approve_or_escalate_node runs it through sql_validator before
+    anything executes."""
     error_type = state.get("error_type")
+    severity = state.get("severity")
     investigation = state.get("investigation", {})
+    parsed_log = state.get("parsed_log", {})
+    error_message = parsed_log.get("error_message", "")
+
+    if severity == "P3":
+        return {"proposed_fix": {
+            "description": "P3 (upstream/infra) — no fix attempted, logged only.",
+            "risk_level": "low", "sql": None, "auto_applicable": False, "source": "none",
+        }}
+
+    # 1. Mechanical.
+    if error_type == "schema_drift":
+        try:
+            rename = schema_inspector.find_safe_rename()
+        except Exception as exc:
+            logger.error("find_safe_rename failed: %s", exc)
+            rename = None
+        if rename:
+            current_name, canonical_name = rename
+            sql = (
+                f'ALTER TABLE raw.fda_adverse_events '
+                f'RENAME COLUMN "{current_name}" TO "{canonical_name}"'
+            )
+            logger.info("fix: mechanical rename available: %s", sql)
+            return {"proposed_fix": {
+                "description": f"Rename column '{current_name}' back to '{canonical_name}'.",
+                "risk_level": "low", "sql": sql, "auto_applicable": True, "source": "mechanical",
+            }}
+
+    # 2. Qdrant reuse.
+    reused = _try_reuse_prior_fix(error_message)
+    if reused:
+        logger.info("fix: reusing prior fix from Qdrant (score=%.2f, incident_id=%s)",
+                    reused["score"], reused.get("incident_id"))
+        return {"proposed_fix": {
+            "description": (
+                f"Reusing a previously successful fix for a similar incident "
+                f"(similarity {reused['score']:.2f}): {reused['description']}"
+            ),
+            "risk_level": reused.get("risk_level") or "medium",
+            "sql": reused.get("sql"),
+            "auto_applicable": False,
+            "source": "qdrant_reuse",
+        }}
+
+    # 3. Fresh OpenAI generation, with real schema context — not just
+    # investigation.details.schema_diff, which can itself already be
+    # stale (see schema_inspector.find_safe_rename()'s docstring).
+    try:
+        current_schema = schema_inspector.get_current_columns()
+    except Exception as exc:
+        logger.warning("get_current_columns failed: %s", exc)
+        current_schema = {}
+    try:
+        previous_schema = schema_inspector.get_previous_snapshot()
+    except Exception as exc:
+        logger.warning("get_previous_snapshot failed: %s", exc)
+        previous_schema = None
 
     prompt = (
         f"A '{error_type}' failure was investigated in the FDA adverse events "
-        f"pipeline.\n\nInvestigation summary: {investigation.get('summary')}\n"
-        f"Investigation details: {json.dumps(investigation.get('details', {}), default=str)[:4000]}\n\n"
-        "Propose a fix for a human on-call engineer to review. Be honest about "
-        "risk_level — most fixes should be medium or high; only mark low if "
-        "this is a purely mechanical, reversible correction."
+        f"pipeline.\n\n"
+        f"Error message: {error_message}\n"
+        f"Investigation summary: {investigation.get('summary')}\n"
+        f"Investigation details: {json.dumps(investigation.get('details', {}), default=str)[:3000]}\n\n"
+        f"Current live columns of raw.fda_adverse_events: {sorted(current_schema)}\n"
+        f"Most recent schema snapshot (this can itself already reflect a "
+        f"past drift rather than the true original schema — treat it as "
+        f"context, not ground truth): "
+        f"{sorted(previous_schema) if previous_schema else 'none recorded'}\n\n"
+        "Propose a fix. If a single SQL statement would genuinely resolve "
+        "this, propose exactly one. If no SQL fix makes sense — this needs "
+        "a human's domain judgment, or nothing in the database is actually "
+        "wrong — leave sql empty and say so in the description. Be honest "
+        "about risk_level."
     )
 
     result = _llm().with_structured_output(_ProposedFixLLM).invoke(prompt)
-    logger.info("fix: risk_level=%s auto_applicable=%s description=%s",
-                result.risk_level, result.auto_applicable, result.description)
+    logger.info("fix: source=llm risk_level=%s sql=%r description=%s",
+                result.risk_level, result.sql, result.description)
 
     return {
         "proposed_fix": {
             "description": result.description,
             "risk_level": result.risk_level,
             "sql": result.sql,
-            "auto_applicable": result.auto_applicable,
+            "auto_applicable": False,
+            "source": "llm",
         }
     }
 
@@ -356,32 +474,44 @@ def _retry_airflow_task(alert: dict) -> Optional[str]:
 
 
 def approve_or_escalate_node(state: AgentState) -> dict:
-    """Severity (P0-P3, from classify_node) drives the response strategy;
-    risk_level (from fix_node) only ever affects message framing here —
-    it no longer gates whether an action is taken, since none of the
-    actions this node takes are LLM-proposed SQL (see module docstring).
+    """Severity (P0-P3, from classify_node) still drives the overall
+    response strategy. sql_validator.classify_sql() is a second,
+    orthogonal gate on top of it that decides whether *this specific
+    proposed fix* is safe to run — see the module docstring for the
+    three tiers. The two combine as:
 
       P0 (data corruption): pause the DAG immediately, escalate via
       Slack now, then via email/re-confirmed-pause on the timeout
-      ladder enforced by escalation_scheduler.py if unacknowledged.
+      ladder if unacknowledged. Never attempts a fix — unchanged.
 
-      P1 (schema drift / volume anomaly): apply the narrow safe schema
-      fix immediately if it applies; otherwise send a Slack approval
-      request that auto-applies (retries the task) after
-      SLACK_TIMEOUT_MINUTES if nobody responds.
+      P3 (upstream/infra): log only, no fix attempted — unchanged.
 
-      P2 (data quality / freshness): retry the task silently, log only
-      — no Slack message at all.
+      P1 / P2, no SQL proposed: just retry the task (existing
+      behavior for e.g. volume_anomaly with nothing mechanical to fix).
 
-      P3 (upstream/infra): log only, no fix attempted, matching the
-      existing behavior for this category.
+      P1 / P2, SQL classified AUTO_EXECUTABLE (always a verified
+      rename): apply it, retry, notify on P1 / log only on P2.
+
+      P1 / P2, SQL classified NEEDS_APPROVAL: always goes to Slack
+      with the SQL shown, regardless of severity — a real data
+      mutation isn't "no real risk" just because its error category
+      is. P1 auto-applies (executes the shown SQL, then retries) after
+      SLACK_TIMEOUT_MINUTES if nobody responds; P2 waits for an
+      explicit human decision rather than defaulting into running a
+      mutation nobody confirmed.
+
+      P1 / P2, SQL classified REJECTED: never executed, never offered
+      for approval, but always surfaced to Slack even for P2 —
+      silently dropping something flagged dangerous would hide a real
+      problem instead of handling it quietly.
     """
     alert = state["alert"]
     error_type = state.get("error_type", "upstream_failure")
     severity = state.get("severity") or SEVERITY_MAP.get(error_type, "P3")
-    investigation = state.get("investigation", {})
     proposed_fix = state.get("proposed_fix", {})
     risk_level = proposed_fix.get("risk_level", "high")
+    source = proposed_fix.get("source", "none")
+    sql = proposed_fix.get("sql")
 
     incident_id = str(uuid.uuid4())
     summary = (
@@ -413,71 +543,90 @@ def approve_or_escalate_node(state: AgentState) -> dict:
         except Exception as exc:
             logger.warning("Slack approval request failed (non-fatal): %s", exc)
 
-        return {"approval_status": "escalated"}
-
-    # ---------------- P1: safe fix now, else timeout-gated approval -------
-    if severity == "P1":
-        applied_detail = None
-        if error_type == "schema_drift":
-            try:
-                applied_detail = schema_inspector.apply_safe_rename_fix()
-            except Exception as exc:
-                logger.error("auto-fix attempt failed: %s", exc)
-
-        if applied_detail:
-            retry_detail = _retry_airflow_task(alert)
-            detail = applied_detail + (f" {retry_detail}" if retry_detail else "")
-            try:
-                post_notification(f"✅ P1 auto-fixed: {summary}\n{detail}")
-            except Exception as exc:
-                logger.warning("Slack notification failed (non-fatal): %s", exc)
-            logger.info("approve_or_escalate: P1 auto_approved. %s", detail)
-            return {"approval_status": "auto_approved"}
-
-        # No mechanical fix applied yet (e.g. volume_anomaly with nothing
-        # to rename, or the rename attempt above raised). For schema_drift
-        # specifically, still check read-only whether a safe rename is
-        # identifiable — if so, preview it in the Slack message so a human
-        # (or escalation_scheduler on timeout) knows exactly what approving
-        # will do; handle_slack_action re-attempts the same fix on approval.
-        approval_summary = summary
-        if error_type == "schema_drift":
-            try:
-                rename = schema_inspector.find_safe_rename()
-            except Exception as exc:
-                logger.error("find_safe_rename failed: %s", exc)
-                rename = None
-            if rename:
-                current_name, canonical_name = rename
-                approval_summary += (
-                    f"\nWill rename column '{current_name}' back to "
-                    f"'{canonical_name}' if approved."
-                )
-
-        # Ask, but don't block on an answer: escalation_scheduler retries
-        # the task on our behalf after SLACK_TIMEOUT_MINUTES if nobody
-        # responds.
-        try:
-            request_approval(
-                incident_id=incident_id, summary=approval_summary, risk_level=risk_level,
-                dag_id=alert["dag_id"], run_id=alert["run_id"], task_id=alert["task_id"],
-                severity="P1", timeout_minutes=SLACK_TIMEOUT_MINUTES,
-            )
-        except Exception as exc:
-            logger.warning("Slack approval request failed (non-fatal): %s", exc)
-
-        logger.info("approve_or_escalate: P1 pending (incident_id=%s)", incident_id)
-        return {"approval_status": "pending"}
-
-    # ---------------- P2: silent auto-fix, no Slack ------------------------
-    if severity == "P2":
-        retry_detail = _retry_airflow_task(alert)
-        logger.info("approve_or_escalate: P2 auto_approved (silent). %s", retry_detail)
-        return {"approval_status": "auto_approved"}
+        return {"approval_status": "escalated", "fix_executed": False}
 
     # ---------------- P3: log only ------------------------------------------
-    logger.info("approve_or_escalate: P3 — logged only, no fix attempted.")
-    return {"approval_status": "auto_approved"}
+    if severity == "P3":
+        logger.info("approve_or_escalate: P3 — logged only, no fix attempted.")
+        return {"approval_status": "auto_approved", "fix_executed": False}
+
+    # ---------------- P1 / P2: classify the proposed SQL and route --------
+    classification = sql_validator.classify_sql(sql) if sql else None
+
+    if classification is None:
+        retry_detail = _retry_airflow_task(alert)
+        if severity == "P1":
+            try:
+                post_notification(f"↻ P1: {summary}\n{retry_detail or 'Retry attempted.'}")
+            except Exception as exc:
+                logger.warning("Slack notification failed (non-fatal): %s", exc)
+        logger.info("approve_or_escalate: %s, no SQL proposed, retried. %s", severity, retry_detail)
+        return {"approval_status": "auto_approved", "fix_executed": False}
+
+    if classification.tier == sql_validator.SqlTier.REJECTED:
+        try:
+            post_notification(
+                f"⛔ Proposed fix rejected as unsafe ({source}): {summary}\n"
+                f"Reason: {classification.reason}\nProposed SQL: {sql}"
+            )
+        except Exception as exc:
+            logger.warning("Slack notification failed (non-fatal): %s", exc)
+        logger.warning("approve_or_escalate: fix REJECTED — %s", classification.reason)
+        return {"approval_status": "escalated", "fix_executed": False}
+
+    if classification.tier == sql_validator.SqlTier.AUTO_EXECUTABLE:
+        # Never trust the proposed text directly, even here — re-derive
+        # and verify against live information_schema (see module
+        # docstring). If it no longer applies (someone already fixed
+        # it, or the proposal was simply wrong), fall back to a plain
+        # retry rather than running unverified text.
+        applied_detail = None
+        try:
+            applied_detail = schema_inspector.apply_safe_rename_fix()
+        except Exception as exc:
+            logger.error("apply_safe_rename_fix failed: %s", exc)
+
+        retry_detail = _retry_airflow_task(alert)
+        if applied_detail:
+            detail = applied_detail + (f" {retry_detail}" if retry_detail else "")
+            if severity == "P1":
+                try:
+                    post_notification(f"✅ Auto-fixed ({source}): {summary}\n{detail}")
+                except Exception as exc:
+                    logger.warning("Slack notification failed (non-fatal): %s", exc)
+            logger.info("approve_or_escalate: %s auto_approved. %s", severity, detail)
+        else:
+            logger.info("approve_or_escalate: proposed rename (%s) no longer applies, retried instead. %s",
+                        source, retry_detail)
+        return {"approval_status": "auto_approved", "fix_executed": bool(applied_detail)}
+
+    # NEEDS_APPROVAL — always to Slack with the SQL shown, whether P1
+    # or P2. P1 auto-applies on timeout (escalation_scheduler executes
+    # the shown SQL, then retries); P2 has no timeout — it waits for
+    # an explicit human decision rather than defaulting a data
+    # mutation into running because nobody happened to respond.
+    timeout = SLACK_TIMEOUT_MINUTES if severity == "P1" else 0
+    try:
+        request_approval(
+            incident_id=incident_id, summary=f"{summary}\n({classification.reason})",
+            risk_level=risk_level,
+            dag_id=alert["dag_id"], run_id=alert["run_id"], task_id=alert["task_id"],
+            severity=severity, timeout_minutes=timeout, proposed_sql=sql,
+        )
+    except Exception as exc:
+        logger.warning("Slack approval request failed (non-fatal): %s", exc)
+
+    logger.info("approve_or_escalate: %s pending approval (incident_id=%s, sql_tier=%s)",
+                severity, incident_id, classification.tier.value)
+    # Not yet known — resolved later, asynchronously, by a human's
+    # Slack click or escalation_scheduler's timeout. postmortem_node
+    # runs once, synchronously, right after this — it can't see that
+    # future outcome, so this incident's Qdrant entry won't be
+    # eligible for reuse until/unless it's written again later (it
+    # currently isn't — same known limitation as monitoring.
+    # incident_reports going stale for anything that doesn't resolve
+    # immediately).
+    return {"approval_status": "pending", "fix_executed": False}
 
 
 # --------------------------------------------------------------------------
