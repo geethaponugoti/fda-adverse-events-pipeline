@@ -38,7 +38,21 @@ def retry_task(dag_id: str, dag_run_id: str, task_id: str) -> dict:
     only_failed is deliberately omitted (not just left False) —
     "upstream_failed" tasks aren't "failed", so that filter would
     silently exclude exactly the downstream tasks include_downstream
-    is meant to catch."""
+    is meant to catch.
+
+    reset_dag_runs=True is supposed to flip the DagRun itself back to
+    a schedulable state too, but it loses a real race: if
+    on_failure_callback fires (this function gets called) at almost
+    the same moment the scheduler's own "all tasks terminal, mark this
+    DagRun failed" transaction commits, clearTaskInstances can return
+    success having cleared the task instances while the DagRun row
+    itself is left stuck in 'failed' — a terminal state the scheduler
+    never revisits on its own, so the pipeline just stops. Reproduced
+    live: task instances went back to None, but the run sat 'failed'
+    until manually re-queued. Explicitly re-queuing the DagRun after
+    the clear closes that race — cheap and idempotent even when there
+    was no race (the run is already 'running' or 'queued' in that
+    case, and setting it to 'queued' again is a no-op)."""
     resp = requests.post(
         f"{AIRFLOW_API_URL}/dags/{dag_id}/clearTaskInstances",
         auth=_auth(),
@@ -52,7 +66,17 @@ def retry_task(dag_id: str, dag_run_id: str, task_id: str) -> dict:
         timeout=_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
-    return resp.json()
+    result = resp.json()
+
+    requeue_resp = requests.patch(
+        f"{AIRFLOW_API_URL}/dags/{dag_id}/dagRuns/{dag_run_id}",
+        auth=_auth(),
+        json={"state": "queued"},
+        timeout=_TIMEOUT_SECONDS,
+    )
+    requeue_resp.raise_for_status()
+
+    return result
 
 
 def pause_dag(dag_id: str) -> dict:
