@@ -20,5 +20,4 @@ dbt_project/.user.yml
 # Local pipeline output (data lands in S3, not committed here)
 data/
 
-# Claude Code session state
-.claude/
+
