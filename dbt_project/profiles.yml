@@ -3,10 +3,10 @@ fda_pipeline:
   outputs:
     dev:
       type:     postgres
-      host:     postgres
-      user:     pipeline
-      password: pipeline
-      port:     5432
-      dbname:   fda_pipeline
+      host:     "{{ env_var('PIPELINE_DB_HOST') }}"
+      user:     "{{ env_var('PIPELINE_DB_USER') }}"
+      password: "{{ env_var('PIPELINE_DB_PASSWORD') }}"
+      port:     "{{ env_var('PIPELINE_DB_PORT') | as_number }}"
+      dbname:   "{{ env_var('PIPELINE_DB_NAME') }}"
       schema:   staging
       threads:  4
