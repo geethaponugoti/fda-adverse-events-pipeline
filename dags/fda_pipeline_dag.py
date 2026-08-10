@@ -11,8 +11,10 @@ No agent code in Part 1.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import os
+import re
 import subprocess
 import time
 from datetime import date, timedelta
@@ -57,13 +59,67 @@ EXPECTED_COLUMNS = {
     "drug_name", "reaction", "country"
 }
 
-# Date range that has confirmed data in the API
+# Seed date range, used only the first time the DAG ever runs (once
+# monitoring.pipeline_runs / the fda_extraction_cursor Variable exist,
+# the cursor below is the source of truth). openFDA's `skip` parameter
+# has a hard ceiling of 25,000 combined with `limit` -- once a date
+# range's pagination reaches that ceiling (or genuinely runs out of
+# results), extract_fda_data auto-shifts the cursor to the previous
+# year and keeps going, rather than treating range exhaustion as an
+# API outage.
 FDA_DATE_RANGE = "receiptdate:[20250401 TO 20260401]"
+
+# openFDA has no confirmed data before FAERS' effective start; refuses
+# to shift past this so a genuine, unrelated API problem can't turn
+# into an infinite regression through empty years.
+FDA_EARLIEST_YEAR = 2004
+
+FDA_CURSOR_VARIABLE = "fda_extraction_cursor"
 
 # Exponential backoff for FDA API failures: 1min, 2min, 4min between the
 # 4 total attempts (1 initial + 3 retries). If all of them fail, extract
 # falls back to the most recent cached file in S3.
 FDA_API_BACKOFF_SECONDS = [60, 120, 240]
+
+
+class FdaSkipLimitExceeded(Exception):
+    """openFDA hard-caps skip+limit at 25,000 regardless of how many
+    matching records actually exist for a query -- once a date range's
+    pagination cursor reaches that ceiling, the API returns 400 Bad
+    Request instead of results, even if the range genuinely has more
+    records past that point. Distinct from a transient outage:
+    retrying the same request is pointless, the only way forward is a
+    narrower (earlier) date range with a fresh cursor."""
+
+
+def _get_extraction_cursor() -> dict:
+    raw = Variable.get(FDA_CURSOR_VARIABLE, default_var=None)
+    if raw is None:
+        return {"date_range": FDA_DATE_RANGE, "skip": 0}
+    return json.loads(raw)
+
+
+def _set_extraction_cursor(date_range: str, skip: int) -> None:
+    Variable.set(FDA_CURSOR_VARIABLE, json.dumps({"date_range": date_range, "skip": skip}))
+
+
+def _shift_date_range_back_one_year(date_range: str) -> str:
+    """'receiptdate:[20250401 TO 20260401]' -> 'receiptdate:[20240401 TO 20250401]'.
+    Only the year component moves; day/month stay fixed, so this never
+    has to reason about leap years."""
+    match = re.match(r"receiptdate:\[(\d{4})(\d{4}) TO (\d{4})(\d{4})\]", date_range)
+    if not match:
+        raise ValueError(f"Can't parse FDA date range to shift it: {date_range!r}")
+    start_year, start_rest, end_year, end_rest = match.groups()
+    new_start_year, new_end_year = int(start_year) - 1, int(end_year) - 1
+    if new_start_year < FDA_EARLIEST_YEAR:
+        raise ValueError(
+            f"Refusing to shift {date_range!r} back to {new_start_year} -- "
+            f"below FDA_EARLIEST_YEAR ({FDA_EARLIEST_YEAR}). This means every "
+            f"year back to {FDA_EARLIEST_YEAR} has already been paginated, or "
+            f"something other than genuine range exhaustion is going on."
+        )
+    return f"receiptdate:[{new_start_year}{start_rest} TO {new_end_year}{end_rest}]"
 
 
 def _engine():
@@ -164,21 +220,30 @@ def _read_csv_from_s3(s3_key: str, **read_csv_kwargs) -> pd.DataFrame:
     return pd.read_csv(obj["Body"], **read_csv_kwargs)
 
 
-def _fetch_fda_pages(skip_start: int, load_date: str) -> list:
+def _fetch_fda_pages(date_range: str, skip_start: int, load_date: str) -> list:
     """One full paginated fetch attempt. Raises on any request failure
-    (timeout, connection error, non-404 HTTP error) so the caller can
-    retry with backoff — a failure partway through a page set leaves an
-    incomplete/inconsistent result, not something worth keeping."""
+    (timeout, connection error, non-404/non-400 HTTP error) so the
+    caller can retry with backoff — a failure partway through a page
+    set leaves an incomplete/inconsistent result, not something worth
+    keeping. A 400 is treated separately (FdaSkipLimitExceeded) since
+    it means this date range's cursor is exhausted, not that the API
+    is having a bad moment — see that exception's docstring."""
     all_rows = []
     skip = skip_start
 
     for page in range(MAX_PAGES):
-        params = {"search": FDA_DATE_RANGE, "limit": PAGE_LIMIT, "skip": skip}
+        params = {"search": date_range, "limit": PAGE_LIMIT, "skip": skip}
         resp = requests.get(FDA_API_URL, params=params, timeout=30)
 
         if resp.status_code == 404:
             logger.info("No FDA reports found")
             break
+
+        if resp.status_code == 400:
+            raise FdaSkipLimitExceeded(
+                f"FDA API returned 400 at skip={skip} for range {date_range!r} "
+                f"(openFDA caps skip+limit at 25,000): {resp.text[:300]}"
+            )
 
         resp.raise_for_status()
         data = resp.json()
@@ -201,10 +266,15 @@ def _fetch_fda_pages(skip_start: int, load_date: str) -> list:
     return all_rows
 
 
-def _fetch_fda_data_with_backoff(skip_start: int, load_date: str) -> list:
+def _fetch_fda_data_with_backoff(date_range: str, skip_start: int, load_date: str) -> list:
     """Retries the full FDA API fetch with exponential backoff
     (FDA_API_BACKOFF_SECONDS) on transient failures. Re-raises the last
-    exception if every attempt fails, so the caller can fall back to S3."""
+    exception if every attempt fails, so the caller can fall back to S3.
+
+    FdaSkipLimitExceeded is deliberately not caught here — it's not
+    transient, so burning through 7 minutes of backoff retrying the
+    exact same doomed request would just delay the caller shifting to
+    a new date range, which is the only thing that actually helps."""
     last_exc = None
     for attempt, delay in enumerate([0] + FDA_API_BACKOFF_SECONDS):
         if delay:
@@ -214,7 +284,7 @@ def _fetch_fda_data_with_backoff(skip_start: int, load_date: str) -> list:
             )
             time.sleep(delay)
         try:
-            return _fetch_fda_pages(skip_start, load_date)
+            return _fetch_fda_pages(date_range, skip_start, load_date)
         except requests.exceptions.RequestException as exc:
             last_exc = exc
 
@@ -347,6 +417,38 @@ def check_failure_injection(**context):
         raise
 
 
+def _fetch_with_auto_shift(date_range: str, skip_start: int, load_date: str) -> tuple:
+    """Fetches at (date_range, skip_start). If that range turns out to
+    be exhausted -- either openFDA's 400 skip-limit response, or a
+    clean empty result set (the range's true total was smaller than
+    25,000, so it never hit the 400 but still has nothing left) --
+    shifts the cursor to the previous year and retries once at
+    skip=0. Persists the new cursor as soon as the shift decision is
+    made, before the retry fetch, so a crash mid-retry doesn't lose
+    the shift. Returns (rows, date_range, skip_start) reflecting
+    whatever range/skip was actually used, so the caller persists the
+    right thing regardless of whether a shift happened."""
+    try:
+        rows = _fetch_fda_data_with_backoff(date_range, skip_start, load_date)
+    except FdaSkipLimitExceeded as exc:
+        new_range = _shift_date_range_back_one_year(date_range)
+        logger.warning("%s — shifting to previous year and retrying: %s", exc, new_range)
+        _set_extraction_cursor(new_range, 0)
+        return _fetch_fda_data_with_backoff(new_range, 0, load_date), new_range, 0
+
+    if not rows:
+        new_range = _shift_date_range_back_one_year(date_range)
+        logger.info(
+            "Range %s fully paginated at skip=%d with no more results — "
+            "shifting to previous year and retrying: %s",
+            date_range, skip_start, new_range,
+        )
+        _set_extraction_cursor(new_range, 0)
+        return _fetch_fda_data_with_backoff(new_range, 0, load_date), new_range, 0
+
+    return rows, date_range, skip_start
+
+
 def extract_fda_data(**context):
     dag_id    = context["dag"].dag_id
     run_id    = context["run_id"]
@@ -356,18 +458,24 @@ def extract_fda_data(**context):
     run_row_id = _log_start(dag_id, run_id, task_id)
     try:
         with _engine().begin() as conn:
-            already_loaded = conn.execute(text(
+            total_loaded = conn.execute(text(
                 "SELECT COUNT(*) FROM raw.fda_adverse_events"
             )).scalar_one()
 
+        cursor = _get_extraction_cursor()
+        date_range, skip_start = cursor["date_range"], cursor["skip"]
+
         logger.info(
             "Fetching FDA adverse events for range %s, starting at skip=%d "
-            "(%d records already loaded)", FDA_DATE_RANGE, already_loaded, already_loaded
+            "(%d total records loaded across all ranges so far)",
+            date_range, skip_start, total_loaded,
         )
 
         used_cache = False
         try:
-            all_rows = _fetch_fda_data_with_backoff(already_loaded, load_date)
+            all_rows, date_range, skip_start = _fetch_with_auto_shift(
+                date_range, skip_start, load_date
+            )
         except requests.exceptions.RequestException as exc:
             logger.error(
                 "FDA API unreachable after %d attempts (%s) — falling back "
@@ -380,8 +488,9 @@ def extract_fda_data(**context):
         if not used_cache:
             if not all_rows:
                 logger.warning(
-                    "No new records returned from FDA API at skip=%d — "
-                    "date range is fully paginated, nothing to load", already_loaded
+                    "No new records returned from FDA API for range %s "
+                    "even after shifting back a year — nothing to load",
+                    date_range,
                 )
                 _log_finish(run_row_id, "success", rows_processed=0)
                 raise AirflowSkipException(
@@ -405,6 +514,11 @@ def extract_fda_data(**context):
                 )
 
             logger.info("Saved %d rows to s3://%s/%s", len(df), S3_BUCKET, s3_key)
+
+            # Advances by however many rows this run actually pulled, within
+            # whatever range _fetch_with_auto_shift settled on -- if it
+            # shifted, skip_start is already 0 for the new range here.
+            _set_extraction_cursor(date_range, skip_start + len(all_rows))
 
         context["ti"].xcom_push(key="s3_key",     value=s3_key)
         context["ti"].xcom_push(key="row_count",  value=len(df))
