@@ -92,10 +92,19 @@ class FdaSkipLimitExceeded(Exception):
     narrower (earlier) date range with a fresh cursor."""
 
 
-def _get_extraction_cursor() -> dict:
+def _get_extraction_cursor(default_skip: int = 0) -> dict:
+    """default_skip matters the first time this Variable is ever read:
+    if the table already has rows loaded (e.g. this deployed onto an
+    existing install that predates the cursor Variable), starting a
+    fresh cursor at skip=0 would re-fetch everything already loaded
+    from scratch. Harmless correctness-wise (load_to_postgres upserts
+    on report_id), but wastes runs re-covering already-loaded ground
+    instead of making progress. Callers should pass the table's
+    current row count so a first-ever read picks up where the old
+    row-count-as-cursor approach would have."""
     raw = Variable.get(FDA_CURSOR_VARIABLE, default_var=None)
     if raw is None:
-        return {"date_range": FDA_DATE_RANGE, "skip": 0}
+        return {"date_range": FDA_DATE_RANGE, "skip": default_skip}
     return json.loads(raw)
 
 
@@ -462,7 +471,7 @@ def extract_fda_data(**context):
                 "SELECT COUNT(*) FROM raw.fda_adverse_events"
             )).scalar_one()
 
-        cursor = _get_extraction_cursor()
+        cursor = _get_extraction_cursor(default_skip=total_loaded)
         date_range, skip_start = cursor["date_range"], cursor["skip"]
 
         logger.info(
