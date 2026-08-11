@@ -30,23 +30,23 @@ openFDA API
      │
      ▼
 ┌────────────────────────────────────────────────────────────┐
-│  Airflow DAG (fda_pipeline_dag)               EC2 #1        │
-│                                                               │
-│  check_failure_injection → extract_fda_data →                │
-│    validate_raw_schema → load_to_postgres → trigger_dbt_run  │
+│  Airflow DAG (fda_pipeline_dag)               EC2 #1       │
+│                                                            │
+│  check_failure_injection → extract_fda_data →              │
+│    validate_raw_schema → load_to_postgres → trigger_dbt_run│
 └────────────────────────────────────────────────────────────┘
      │                    │                        │      │
      ▼                    ▼                        ▼      │ on_failure_callback
   AWS S3          RDS PostgreSQL (raw)       dbt (staging  │      │
  (raw CSVs)         idempotent upsert         → mart)      │      ▼
-                            │                         ┌───────────────────────┐
+                            │                         ┌─────────────────────── ┐
                             ▼                         │  Self-Healing Agent    │
                    Streamlit dashboard                │  (LangGraph)  EC2 #2   │
-              (KPIs, drug/reaction analytics,          │  ingest → classify →  │
-                 pipeline run history)                  │  investigate → fix →  │
-                                                          │  approve/escalate →  │
-                                                          │  postmortem           │
-                                                          └──────┬──────┬────────┘
+              (KPIs, drug/reaction analytics,         │  ingest → classify →   │
+                 pipeline run history)                │  investigate → fix →   │
+                                                      │  approve/escalate →    │
+                                                      │  postmortem            │
+                                                      └──────┬──────┬──────────┘
                                                                  │      │
                                                     Slack approval  Qdrant Cloud
                                                     (safety-gated)  (incident memory)
@@ -127,7 +127,8 @@ On failure, any task's `on_failure_callback` posts the error to the self-healing
 
 ## Data
 
-Real FDA adverse event reports pulled live from the [openFDA API](https://open.fda.gov/apis/drug/event/), covering reports received April 2025 through April 2026. Drug names, reactions, patient demographics, and outcomes are all real values as reported to the FDA — nothing here is synthetic.
+Real FDA adverse event reports pulled live from the openFDA API. Drug names, reactions, patient demographics, and outcomes are all real values as reported to the FDA — nothing here is synthetic.
+The pipeline automatically manages the openFDA API's 25,000 record limit by shifting to the previous year's date range when the current range is exhausted, ensuring continuous data collection. Data coverage spans from 2004 to present day.
 
 ## Monitoring and failure injection
 
