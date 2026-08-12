@@ -175,14 +175,15 @@ Human approval, when needed, happens in Slack: `agent/mcp_servers/slack_server.p
 
 ## Dashboard
 
-The Streamlit dashboard (`scripts/dashboard.py`) surfaces:
+The Streamlit dashboard (`scripts/dashboard.py`) is a two-section ops console reading live data from RDS and the Airflow REST API:
 
-- KPI cards: reports loaded today, serious reports, fatal reports, unique drugs
-- Top 10 drugs by adverse report volume
-- Most common reactions, with serious/fatal breakdowns
-- Serious events ranked by drug and outcome
-- A filterable raw data preview (by drug name and date range)
-- Pipeline run history, with expandable error detail on any failed run
+- **Pipeline** — `fda_pipeline_dag`'s 5 tasks (`check_failure_injection` → `extract_fda_data` → `validate_raw_schema` → `load_to_postgres` → `trigger_dbt_run`) as a stage flow for the latest run, colored by real status and cross-checked against `monitoring.incident_reports` so a task the agent auto-fixed shows "AI Healed" instead of "Failed"; plus run history, data freshness, and the row-count trend.
+- **Agent** — the LangGraph node sequence (`ingest → classify → investigate → fix → approve_or_escalate → postmortem`), the most recent incident's root cause and fix (from `monitoring.incident_reports`), and incident history with each decision (`Auto-Resolved` / `Approved` / `Rejected` / `Escalated` / `Pending`).
+
+```bash
+pip install -r scripts/requirements.txt
+streamlit run scripts/dashboard.py
+```
 
 ## Project structure
 
