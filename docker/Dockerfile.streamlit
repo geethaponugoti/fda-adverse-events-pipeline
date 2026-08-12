@@ -2,8 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY scripts/requirements.txt ./scripts/requirements.txt
-RUN pip install --no-cache-dir -r scripts/requirements.txt
+RUN pip install --no-cache-dir \
+    streamlit \
+    pandas \
+    sqlalchemy \
+    psycopg2-binary \
+    requests
 
 COPY scripts/ ./scripts/
 COPY .streamlit/ ./.streamlit/

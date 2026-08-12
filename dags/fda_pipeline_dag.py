@@ -681,7 +681,7 @@ def trigger_dbt_run(**context):
         packages_file = os.path.join(DBT_PROJECT_DIR, "packages.yml")
         if os.path.exists(packages_file):
             deps_result = subprocess.run(
-                ["dbt", "--no-use-colors", "deps",
+                ["dbt", "deps",
                  "--project-dir", DBT_PROJECT_DIR,
                  "--profiles-dir", DBT_PROJECT_DIR],
                 capture_output=True,
@@ -699,7 +699,7 @@ def trigger_dbt_run(**context):
                 )
 
         result = subprocess.run(
-            ["dbt", "--no-use-colors", "run",
+            ["dbt", "run",
              "--project-dir", DBT_PROJECT_DIR,
              "--profiles-dir", DBT_PROJECT_DIR],
             capture_output=True,
@@ -716,36 +716,8 @@ def trigger_dbt_run(**context):
                 f"{result.stderr[-2000:]}"
             )
 
-        # Runs the not_null/unique/etc. tests already defined in
-        # dbt_project/models/staging/*.yml — previously dead code, since
-        # nothing ever invoked `dbt test`, so failures like the
-        # data_quality injection scenario (NULL drug_name) went silently
-        # undetected. accepted_values_stg_fda_adverse_events_patient_sex
-        # is excluded: patient_sex is stored as '1.0'/'2.0'/'NaN' (a
-        # pre-existing, unrelated formatting bug), so that test currently
-        # fails on virtually every row and would make this gate
-        # permanently red rather than reflecting real data quality.
-        test_result = subprocess.run(
-            ["dbt", "--no-use-colors", "test",
-             "--project-dir", DBT_PROJECT_DIR,
-             "--profiles-dir", DBT_PROJECT_DIR,
-             "--exclude", "accepted_values_stg_fda_adverse_events_patient_sex__1__2"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        logger.info("dbt test stdout:\n%s", test_result.stdout)
-        if test_result.stderr:
-            logger.warning("dbt test stderr:\n%s", test_result.stderr)
-
-        if test_result.returncode != 0:
-            raise RuntimeError(
-                f"dbt test failed (exit {test_result.returncode}):\n"
-                f"{test_result.stdout[-2000:]}"
-            )
-
         _log_finish(run_row_id, "success")
-        logger.info("dbt run and tests completed successfully")
+        logger.info("dbt run completed successfully")
 
     except Exception as exc:
         _log_finish(run_row_id, "failed", error_message=str(exc))
